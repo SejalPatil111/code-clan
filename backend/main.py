@@ -1,10 +1,19 @@
+from datetime import datetime, timedelta
 from typing import List, Optional
 from fastapi import FastAPI, Depends, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import desc
+from sqlalchemy import desc, func, inspect, text
 
 from app.database import Base, engine, get_db
+from app.auth import (
+    hash_password,
+    verify_password,
+    create_access_token,
+    get_current_user,
+    require_roles,
+    require_teacher,
+)
 from app.models import (
     User,
     Problem,
@@ -35,9 +44,28 @@ from app.schemas import (
     CodingTestCreate,
     CodingTestResponse,
     LeaderboardEntry,
+    RegisterRequest,
+    LoginRequest,
+    AuthResponse,
+    StudentProgress,
+    TeacherOverview,
+    StudentOverview,
 )
 
 Base.metadata.create_all(bind=engine)
+
+
+def _run_lightweight_migrations():
+    """create_all() does not add columns to existing tables, so add new ones here."""
+    inspector = inspect(engine)
+    if "users" in inspector.get_table_names():
+        user_cols = {c["name"] for c in inspector.get_columns("users")}
+        if "password_hash" not in user_cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE users ADD COLUMN password_hash VARCHAR(255) NULL"))
+
+
+_run_lightweight_migrations()
 
 app = FastAPI(
     title="Code Clan API",
@@ -62,6 +90,70 @@ def root():
         "status": "healthy",
         "version": "1.0.0",
     }
+
+
+# =========================================================
+# AUTH ENDPOINTS
+# =========================================================
+
+def _normalize_email(email: str) -> str:
+    return email.strip().lower()
+
+
+@app.post("/auth/register", response_model=AuthResponse, status_code=status.HTTP_201_CREATED, tags=["Auth"])
+def register(payload: RegisterRequest, db: Session = Depends(get_db)):
+    """
+    Create a new account. If a legacy user with this email exists but has no password yet
+    (created before authentication was added), the account is claimed and the password set;
+    the existing role is kept.
+    """
+    email = _normalize_email(payload.email)
+    existing = db.query(User).filter(func.lower(User.email) == email).first()
+
+    if existing:
+        if existing.password_hash:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="An account with this email already exists. Please log in.",
+            )
+        existing.password_hash = hash_password(payload.password)
+        existing.name = payload.name.strip() or existing.name
+        db.commit()
+        db.refresh(existing)
+        user = existing
+    else:
+        user = User(
+            name=payload.name.strip(),
+            email=email,
+            role=payload.role,
+            password_hash=hash_password(payload.password),
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    return AuthResponse(access_token=create_access_token(user), user=user)
+
+
+@app.post("/auth/login", response_model=AuthResponse, tags=["Auth"])
+def login(payload: LoginRequest, db: Session = Depends(get_db)):
+    email = _normalize_email(payload.email)
+    user = db.query(User).filter(func.lower(User.email) == email).first()
+
+    if user and not user.password_hash:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="This account has no password yet. Use Sign Up with the same email to set one.",
+        )
+    if not user or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password.")
+
+    return AuthResponse(access_token=create_access_token(user), user=user)
+
+
+@app.get("/auth/me", response_model=UserResponse, tags=["Auth"])
+def read_current_user(current_user: User = Depends(get_current_user)):
+    return current_user
 
 
 # =========================================================
@@ -114,8 +206,13 @@ def get_user(user_id: int, db: Session = Depends(get_db)):
 # =========================================================
 
 @app.post("/problems", response_model=ProblemResponse, status_code=status.HTTP_201_CREATED, tags=["Problems"])
-def create_problem(problem: ProblemCreate, db: Session = Depends(get_db)):
-    creator = db.query(User).filter(User.id == problem.created_by).first()
+def create_problem(
+    problem: ProblemCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_teacher),
+):
+    problem.created_by = current_user.id
+    creator = current_user
     if not creator:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -237,7 +334,12 @@ def get_problem(problem_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/problems/{problem_id}/test-cases", response_model=TestCaseResponse, status_code=status.HTTP_201_CREATED, tags=["Problems"])
-def add_test_case(problem_id: int, test_case: TestCaseCreate, db: Session = Depends(get_db)):
+def add_test_case(
+    problem_id: int,
+    test_case: TestCaseCreate,
+    db: Session = Depends(get_db),
+    _teacher: User = Depends(require_teacher),
+):
     problem = db.query(Problem).filter(Problem.id == problem_id).first()
     if not problem:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Problem not found.")
@@ -469,8 +571,13 @@ def _build_assignment_response(a: Assignment) -> AssignmentResponse:
 
 
 @app.post("/assignments", response_model=AssignmentResponse, status_code=status.HTTP_201_CREATED, tags=["Assignments"])
-def create_assignment(payload: AssignmentCreate, db: Session = Depends(get_db)):
-    creator = db.query(User).filter(User.id == payload.created_by).first()
+def create_assignment(
+    payload: AssignmentCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_teacher),
+):
+    payload.created_by = current_user.id
+    creator = current_user
     if not creator:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Creator user not found.")
 
@@ -529,7 +636,7 @@ def get_assignment(assignment_id: int, db: Session = Depends(get_db)):
 # CODING TEST ENDPOINTS
 # =========================================================
 
-def _build_coding_test_response(t: CodingTest) -> CodingTestResponse:
+def _build_coding_test_response(t: CodingTest, student_id: Optional[int] = None) -> CodingTestResponse:
     prob_list = [
         AssignedProblemInfo(
             problem_id=ctp.problem.id,
@@ -543,6 +650,10 @@ def _build_coding_test_response(t: CodingTest) -> CodingTestResponse:
     ]
     enrolled = len(t.students)
     completed = sum(1 for s in t.students if s.status in ("submitted", "completed"))
+    my_status = None
+    if student_id is not None:
+        mine = next((s for s in t.students if s.student_id == student_id), None)
+        my_status = mine.status if mine else "not_started"
     return CodingTestResponse(
         id=t.id,
         title=t.title,
@@ -556,12 +667,18 @@ def _build_coding_test_response(t: CodingTest) -> CodingTestResponse:
         problems=prob_list,
         enrolled_count=enrolled,
         completed_count=completed,
+        my_status=my_status,
     )
 
 
 @app.post("/coding-tests", response_model=CodingTestResponse, status_code=status.HTTP_201_CREATED, tags=["Coding Tests"])
-def create_coding_test(payload: CodingTestCreate, db: Session = Depends(get_db)):
-    creator = db.query(User).filter(User.id == payload.created_by).first()
+def create_coding_test(
+    payload: CodingTestCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_teacher),
+):
+    payload.created_by = current_user.id
+    creator = current_user
     if not creator:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Creator user not found.")
 
@@ -620,9 +737,12 @@ def create_coding_test(payload: CodingTestCreate, db: Session = Depends(get_db))
 
 
 @app.get("/coding-tests", response_model=List[CodingTestResponse], tags=["Coding Tests"])
-def list_coding_tests(db: Session = Depends(get_db)):
+def list_coding_tests(
+    student_id: Optional[int] = Query(None, description="Include this student's status as my_status"),
+    db: Session = Depends(get_db),
+):
     tests = db.query(CodingTest).order_by(desc(CodingTest.created_at)).all()
-    return [_build_coding_test_response(t) for t in tests]
+    return [_build_coding_test_response(t, student_id) for t in tests]
 
 
 @app.get("/coding-tests/{test_id}", response_model=CodingTestResponse, tags=["Coding Tests"])
@@ -718,3 +838,179 @@ def get_leaderboard(db: Session = Depends(get_db)):
         )
 
     return ranked_entries
+
+
+
+# =========================================================
+# ROLE-BASED DASHBOARD ENDPOINTS
+# =========================================================
+
+COMPLETED_TEST_STATUSES = ("submitted", "completed")
+XP_PER_TEST = 10
+
+
+def _submission_to_response(s: Submission) -> SubmissionResponse:
+    return SubmissionResponse(
+        id=s.id,
+        user_id=s.user_id,
+        problem_id=s.problem_id,
+        code=s.code,
+        language=s.language,
+        status=s.status,
+        score=s.score,
+        execution_time=s.execution_time,
+        memory_used=s.memory_used,
+        submitted_at=s.submitted_at,
+        submission_type=s.submission_type,
+        assignment_id=s.assignment_id,
+        coding_test_id=s.coding_test_id,
+        competition_id=s.competition_id,
+        problem_title=s.problem.title if s.problem else "Unknown Problem",
+    )
+
+
+def _student_progress(stu: User, db: Session) -> StudentProgress:
+    tests_done = (
+        db.query(CodingTestStudent)
+        .filter(
+            CodingTestStudent.student_id == stu.id,
+            CodingTestStudent.status.in_(COMPLETED_TEST_STATUSES),
+        )
+        .count()
+    )
+    subs_q = db.query(Submission).filter(Submission.user_id == stu.id)
+    total_subs = subs_q.count()
+    accepted = subs_q.filter(Submission.status == "Accepted").count()
+    attempted = (
+        db.query(func.count(func.distinct(Submission.problem_id)))
+        .filter(Submission.user_id == stu.id)
+        .scalar()
+        or 0
+    )
+    last_sub = subs_q.order_by(desc(Submission.submitted_at)).first()
+    assigned = db.query(AssignmentStudent).filter(AssignmentStudent.student_id == stu.id).count()
+
+    return StudentProgress(
+        user_id=stu.id,
+        name=stu.name,
+        email=stu.email,
+        joined_at=stu.created_at,
+        xp=tests_done * XP_PER_TEST,
+        tests_completed=tests_done,
+        total_submissions=total_subs,
+        accepted_submissions=accepted,
+        problems_attempted=attempted,
+        assignments_assigned=assigned,
+        last_active=last_sub.submitted_at if last_sub else None,
+    )
+
+
+@app.get("/teacher/overview", response_model=TeacherOverview, tags=["Teacher Dashboard"])
+def teacher_overview(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_teacher),
+):
+    """Aggregated class analytics for the teacher dashboard."""
+    students = db.query(User).filter(User.role == "student").all()
+    total_students = len(students)
+    total_tests = db.query(CodingTest).count()
+
+    completed_pairs = (
+        db.query(CodingTestStudent)
+        .filter(CodingTestStudent.status.in_(COMPLETED_TEST_STATUSES))
+        .count()
+    )
+    possible_pairs = total_students * total_tests
+    completion_rate = round((completed_pairs / possible_pairs) * 100, 1) if possible_pairs else 0.0
+
+    difficulty_breakdown = {
+        level: db.query(Problem).filter(Problem.difficulty == level).count()
+        for level in ("Easy", "Medium", "Hard")
+    }
+
+    week_ago = datetime.utcnow() - timedelta(days=7)
+    recent = db.query(Submission).order_by(desc(Submission.submitted_at)).limit(8).all()
+
+    progress = [_student_progress(s, db) for s in students]
+    progress.sort(key=lambda p: (p.xp, p.total_submissions), reverse=True)
+
+    return TeacherOverview(
+        total_students=total_students,
+        total_teachers=db.query(User).filter(User.role.in_(["teacher", "admin"])).count(),
+        total_problems=db.query(Problem).count(),
+        my_problems=db.query(Problem).filter(Problem.created_by == current_user.id).count(),
+        total_assignments=db.query(Assignment).count(),
+        my_assignments=db.query(Assignment).filter(Assignment.created_by == current_user.id).count(),
+        total_coding_tests=total_tests,
+        my_coding_tests=db.query(CodingTest).filter(CodingTest.created_by == current_user.id).count(),
+        total_submissions=db.query(Submission).count(),
+        submissions_last_7_days=db.query(Submission).filter(Submission.submitted_at >= week_ago).count(),
+        test_completion_rate=completion_rate,
+        difficulty_breakdown=difficulty_breakdown,
+        recent_submissions=[_submission_to_response(s) for s in recent],
+        top_students=progress[:5],
+    )
+
+
+@app.get("/teacher/students", response_model=List[StudentProgress], tags=["Teacher Dashboard"])
+def teacher_student_roster(
+    db: Session = Depends(get_db),
+    _teacher: User = Depends(require_teacher),
+):
+    """Per-student progress for every enrolled student."""
+    students = db.query(User).filter(User.role == "student").order_by(User.name).all()
+    return [_student_progress(s, db) for s in students]
+
+
+@app.get("/student/overview", response_model=StudentOverview, tags=["Student Dashboard"])
+def student_overview(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("student")),
+):
+    """Personal progress summary for the logged-in student."""
+    me = _student_progress(current_user, db)
+
+    # Rank among all students (same ordering as /leaderboard)
+    ranking = [_student_progress(s, db) for s in db.query(User).filter(User.role == "student").all()]
+    ranking.sort(key=lambda p: (p.xp, p.tests_completed), reverse=True)
+    rank = next((idx for idx, p in enumerate(ranking, start=1) if p.user_id == current_user.id), None)
+
+    my_assignments = (
+        db.query(Assignment)
+        .join(AssignmentStudent)
+        .filter(AssignmentStudent.student_id == current_user.id)
+        .all()
+    )
+    now = datetime.utcnow()
+    upcoming = sorted(
+        [a for a in my_assignments if a.deadline is None or a.deadline >= now],
+        key=lambda a: (a.deadline is None, a.deadline or now),
+    )[:5]
+
+    tests = db.query(CodingTest).order_by(desc(CodingTest.created_at)).all()
+    test_responses = [_build_coding_test_response(t, current_user.id) for t in tests]
+    pending_tests = [t for t in test_responses if t.my_status not in COMPLETED_TEST_STATUSES][:5]
+
+    recent = (
+        db.query(Submission)
+        .filter(Submission.user_id == current_user.id)
+        .order_by(desc(Submission.submitted_at))
+        .limit(5)
+        .all()
+    )
+
+    return StudentOverview(
+        xp=me.xp,
+        rank=rank,
+        total_ranked=len(ranking),
+        tests_completed=me.tests_completed,
+        tests_available=len(tests),
+        total_submissions=me.total_submissions,
+        accepted_submissions=me.accepted_submissions,
+        problems_attempted=me.problems_attempted,
+        total_problems=db.query(Problem).count(),
+        assignments_assigned=len(my_assignments),
+        upcoming_deadlines=[_build_assignment_response(a) for a in upcoming],
+        pending_tests=pending_tests,
+        recent_submissions=[_submission_to_response(s) for s in recent],
+    )

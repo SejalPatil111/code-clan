@@ -26,6 +26,28 @@ class UserResponse(UserBase):
 
 
 # =========================================================
+# AUTH SCHEMAS
+# =========================================================
+
+class RegisterRequest(BaseModel):
+    name: str = Field(..., min_length=2, max_length=100)
+    email: str = Field(..., min_length=3, max_length=150)
+    password: str = Field(..., min_length=6, max_length=128)
+    role: str = Field("student", pattern="^(student|teacher)$")
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=150)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
+
+# =========================================================
 # TEST CASE SCHEMAS
 # =========================================================
 
@@ -75,7 +97,7 @@ class ProblemBase(BaseModel):
 
 
 class ProblemCreate(ProblemBase):
-    created_by: int
+    created_by: Optional[int] = None  # overridden by the authenticated teacher
     test_cases: Optional[List[TestCaseCreate]] = None
 
 
@@ -138,7 +160,7 @@ class AssignmentProblemItem(BaseModel):
 class AssignmentCreate(BaseModel):
     title: str = Field(..., min_length=3, max_length=200)
     description: Optional[str] = None
-    created_by: int
+    created_by: Optional[int] = None  # overridden by the authenticated teacher
     start_date: Optional[datetime] = None
     deadline: Optional[datetime] = None
     problem_ids: List[int] = []
@@ -196,7 +218,7 @@ class NewCustomProblemInput(BaseModel):
 class CodingTestCreate(BaseModel):
     title: str = Field(..., min_length=3, max_length=200)
     description: Optional[str] = None
-    created_by: int
+    created_by: Optional[int] = None  # overridden by the authenticated teacher
     duration: int = Field(60, ge=5, le=360) # duration in minutes
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
@@ -217,6 +239,7 @@ class CodingTestResponse(BaseModel):
     problems: List[AssignedProblemInfo] = []
     enrolled_count: int = 0
     completed_count: int = 0
+    my_status: Optional[str] = None  # populated when requested for a specific student
 
     class Config:
         from_attributes = True
@@ -237,3 +260,55 @@ class LeaderboardEntry(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+
+# =========================================================
+# DASHBOARD SCHEMAS
+# =========================================================
+
+class StudentProgress(BaseModel):
+    user_id: int
+    name: str
+    email: str
+    joined_at: Optional[datetime] = None
+    xp: int = 0
+    tests_completed: int = 0
+    total_submissions: int = 0
+    accepted_submissions: int = 0
+    problems_attempted: int = 0
+    assignments_assigned: int = 0
+    last_active: Optional[datetime] = None
+
+
+class TeacherOverview(BaseModel):
+    total_students: int
+    total_teachers: int
+    total_problems: int
+    my_problems: int
+    total_assignments: int
+    my_assignments: int
+    total_coding_tests: int
+    my_coding_tests: int
+    total_submissions: int
+    submissions_last_7_days: int
+    test_completion_rate: float  # percentage of (student x test) pairs completed
+    difficulty_breakdown: dict
+    recent_submissions: List[SubmissionResponse] = []
+    top_students: List[StudentProgress] = []
+
+
+class StudentOverview(BaseModel):
+    xp: int
+    rank: Optional[int] = None
+    total_ranked: int
+    tests_completed: int
+    tests_available: int
+    total_submissions: int
+    accepted_submissions: int
+    problems_attempted: int
+    total_problems: int
+    assignments_assigned: int
+    upcoming_deadlines: List[AssignmentResponse] = []
+    pending_tests: List[CodingTestResponse] = []
+    recent_submissions: List[SubmissionResponse] = []

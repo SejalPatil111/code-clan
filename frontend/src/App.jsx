@@ -49,12 +49,69 @@ import {
   completeCodingTest,
   fetchLeaderboard,
 } from "./api";
+import TeacherDashboard from "./components/TeacherDashboard";
+import StudentDashboard from "./components/StudentDashboard";
+import StudentRoster from "./components/StudentRoster";
 import "./App.css";
+import "./components/dashboard.css";
 
-export default function App() {
-  const [activeTab, setActiveTab] = useState("practice");
-  const [userRole, setUserRole] = useState("student"); // Demo role switcher
-  const [currentUser, setCurrentUser] = useState(null);
+// Sidebar navigation per role. `tab` maps to a content section; `sub` selects a
+// teacher workspace panel.
+const STUDENT_NAV = [
+  { section: "Overview" },
+  { tab: "dashboard", label: "My Dashboard", icon: LayoutDashboard },
+  { section: "Learn & Practice" },
+  { tab: "practice", label: "Practice Problems", icon: FileCode2 },
+  { tab: "assignments", label: "My Assignments", icon: BookOpen },
+  { tab: "coding_tests", label: "Coding Tests", icon: Clock },
+  { tab: "submissions", label: "My Submissions", icon: History },
+  { section: "Community" },
+  { tab: "leaderboard", label: "Leaderboard", icon: Award },
+  { tab: "competitions", label: "Competitions", icon: Trophy },
+  { tab: "ai_mentor", label: "AI Mentor", icon: Sparkles },
+];
+
+const TEACHER_NAV = [
+  { section: "Overview" },
+  { tab: "dashboard", label: "Teacher Dashboard", icon: LayoutDashboard },
+  { section: "Course Content" },
+  { tab: "teacher_workspace", sub: "create_problem", label: "Question Bank", icon: PlusCircle },
+  { tab: "teacher_workspace", sub: "create_assignment", label: "Create Assignment", icon: BookOpen },
+  { tab: "teacher_workspace", sub: "create_test", label: "Design Coding Test", icon: Clock },
+  { tab: "teacher_workspace", sub: "manage", label: "Manage Activities", icon: CheckSquare },
+  { section: "Students" },
+  { tab: "students", label: "Student Progress", icon: Users },
+  { tab: "submissions", label: "Class Submissions", icon: History },
+  { tab: "leaderboard", label: "Leaderboard", icon: Award },
+  { section: "More" },
+  { tab: "competitions", label: "Competitions", icon: Trophy },
+  { tab: "ai_mentor", label: "AI Assistant", icon: Sparkles },
+];
+
+const PAGE_TITLES = {
+  dashboard: { student: "My Learning Dashboard", teacher: "Teacher Dashboard" },
+  practice: "Coding Practice & Workspace",
+  assignments: "My Coursework & Assignments",
+  coding_tests: "Coding Tests",
+  leaderboard: "Department Leaderboard",
+  competitions: "Coding Competitions & Hackathons",
+  submissions: { student: "My Submission History", teacher: "Class Submission Records" },
+  ai_mentor: { student: "AI Mentor & Tutor Assistance", teacher: "AI Teaching Assistant" },
+  students: "Student Roster & Progress",
+  teacher_workspace: {
+    create_problem: "Question Bank: Create Problem",
+    create_assignment: "Create & Assign Coursework",
+    create_test: "Design a Coding Test",
+    manage: "Manage Activities",
+  },
+};
+
+export default function App({ currentUser, onLogout }) {
+  const userRole = currentUser.role;
+  const isTeacher = userRole === "teacher" || userRole === "admin";
+  const navItems = isTeacher ? TEACHER_NAV : STUDENT_NAV;
+
+  const [activeTab, setActiveTab] = useState("dashboard");
   const [usersList, setUsersList] = useState([]);
 
   // Practice state
@@ -159,10 +216,6 @@ export default function App() {
     try {
       const data = await fetchUsers();
       setUsersList(data);
-      if (data && data.length > 0) {
-        const matched = data.find((u) => u.role === userRole) || data[0];
-        setCurrentUser(matched);
-      }
     } catch (err) {
       console.error("Error loading users:", err);
     }
@@ -198,9 +251,10 @@ export default function App() {
     }
   };
 
+  // Students only see their own submissions / assignments; teachers see the whole class.
   const loadSubmissions = async () => {
     try {
-      const data = await fetchSubmissions();
+      const data = await fetchSubmissions(isTeacher ? {} : { user_id: currentUser.id });
       setSubmissions(data);
     } catch (err) {
       console.error("Error loading submissions:", err);
@@ -209,7 +263,7 @@ export default function App() {
 
   const loadAssignments = async () => {
     try {
-      const data = await fetchAssignments();
+      const data = await fetchAssignments(isTeacher ? {} : { student_id: currentUser.id });
       setAssignments(data);
     } catch (err) {
       console.error("Error loading assignments:", err);
@@ -218,7 +272,7 @@ export default function App() {
 
   const loadCodingTests = async () => {
     try {
-      const data = await fetchCodingTests();
+      const data = await fetchCodingTests(isTeacher ? {} : { student_id: currentUser.id });
       setCodingTests(data);
     } catch (err) {
       console.error("Error loading coding tests:", err);
@@ -260,7 +314,7 @@ export default function App() {
   };
 
   const handleSubmitSolution = async () => {
-    const activeUserId = currentUser?.id || (usersList.length > 0 ? usersList[0].id : 1);
+    const activeUserId = currentUser.id;
     if (!selectedProblem) return;
     setIsSubmitting(true);
     setLastSubmissionResult(null);
@@ -289,7 +343,7 @@ export default function App() {
     setFormMsg(null);
     setIsSubmittingProblem(true);
 
-    const activeUserId = currentUser?.id || (usersList.length > 0 ? usersList[0].id : 1);
+    const activeUserId = currentUser.id;
 
     try {
       const payload = {
@@ -380,7 +434,7 @@ export default function App() {
     }
 
     setIsSubmittingAssignment(true);
-    const activeUserId = currentUser?.id || (usersList.length > 0 ? usersList[0].id : 1);
+    const activeUserId = currentUser.id;
 
     try {
       const payload = {
@@ -467,7 +521,7 @@ export default function App() {
     }
 
     setIsSubmittingTest(true);
-    const activeUserId = currentUser?.id || (usersList.length > 0 ? usersList[0].id : 1);
+    const activeUserId = currentUser.id;
 
     try {
       const payload = {
@@ -632,7 +686,7 @@ export default function App() {
 
   // Save / Submit Individual Problem in Active Test
   const handleSaveAndSubmitTestProblem = async (prob) => {
-    const activeUserId = currentUser?.id || (usersList.length > 0 ? usersList[0].id : 1);
+    const activeUserId = currentUser.id;
     const code = activeTestSession.answers[prob.problem_id] || "";
     setIsTestEvaluating(true);
 
@@ -663,7 +717,7 @@ export default function App() {
   const handleFinalSubmitTest = async (isAutoSubmit = false) => {
     if (!activeTestSession) return;
     const testId = activeTestSession.test.id;
-    const activeUserId = currentUser?.id || (usersList.length > 0 ? usersList[0].id : 1);
+    const activeUserId = currentUser.id;
 
     setCompletingTestId(testId);
 
@@ -693,7 +747,7 @@ export default function App() {
 
   // Student Test Complete Handler (+10 XP)
   const handleStudentCompleteTest = async (testId) => {
-    const activeUserId = currentUser?.id || (usersList.length > 0 ? usersList[0].id : 1);
+    const activeUserId = currentUser.id;
     setCompletingTestId(testId);
     setTestActionMsg(null);
 
@@ -714,10 +768,41 @@ export default function App() {
 
   const studentUsers = usersList.filter((u) => u.role === "student");
 
-  // Current student's rank from leaderboard
-  const myLeaderboardEntry = leaderboard.find(
-    (e) => e.user_id === (currentUser?.id || (usersList[0]?.id || 1))
-  );
+  // ---------------------------------------------------------
+  // ROLE-BASED NAVIGATION
+  // ---------------------------------------------------------
+  const canAccess = (tab) => navItems.some((n) => n.tab === tab);
+
+  const navigate = (tab, sub) => {
+    if (!canAccess(tab)) return; // block tabs that don't belong to this role
+    setActiveTab(tab);
+    if (sub) setTeacherTab(sub);
+    if (tab === "practice") loadProblems();
+    if (tab === "assignments") loadAssignments();
+    if (tab === "coding_tests") loadCodingTests();
+    if (tab === "leaderboard") loadLeaderboardData();
+    if (tab === "submissions") {
+      loadSubmissions();
+      loadUsers();
+    }
+    if (tab === "teacher_workspace") {
+      loadProblems();
+      loadAssignments();
+      loadCodingTests();
+      loadUsers();
+    }
+  };
+
+  const roleKey = isTeacher ? "teacher" : "student";
+  const titleEntry = PAGE_TITLES[activeTab];
+  const pageTitle =
+    activeTab === "teacher_workspace"
+      ? titleEntry[teacherTab]
+      : typeof titleEntry === "string"
+      ? titleEntry
+      : titleEntry?.[roleKey] || "";
+
+  const userName = (id) => usersList.find((u) => u.id === id)?.name || `User #${id}`;
 
   return (
     <div className="app-container">
@@ -732,95 +817,38 @@ export default function App() {
         </div>
 
         <nav className="nav-menu">
-          <button
-            className={`nav-item ${activeTab === "dashboard" ? "active" : ""}`}
-            onClick={() => setActiveTab("dashboard")}
-          >
-            <LayoutDashboard size={18} /> Dashboard
-          </button>
-          <button
-            className={`nav-item ${activeTab === "practice" ? "active" : ""}`}
-            onClick={() => {
-              setActiveTab("practice");
-              loadProblems();
-            }}
-          >
-            <FileCode2 size={18} /> Practice Problems
-          </button>
-          <button
-            className={`nav-item ${activeTab === "assignments" ? "active" : ""}`}
-            onClick={() => {
-              setActiveTab("assignments");
-              loadAssignments();
-            }}
-          >
-            <BookOpen size={18} /> Assignments
-          </button>
-          <button
-            className={`nav-item ${activeTab === "coding_tests" ? "active" : ""}`}
-            onClick={() => {
-              setActiveTab("coding_tests");
-              loadCodingTests();
-            }}
-          >
-            <Clock size={18} /> Coding Tests
-          </button>
-          <button
-            className={`nav-item ${activeTab === "leaderboard" ? "active" : ""}`}
-            onClick={() => {
-              setActiveTab("leaderboard");
-              loadLeaderboardData();
-            }}
-          >
-            <Award size={18} /> Leaderboard
-          </button>
-          <button
-            className={`nav-item ${activeTab === "competitions" ? "active" : ""}`}
-            onClick={() => setActiveTab("competitions")}
-          >
-            <Trophy size={18} /> Competitions
-          </button>
-          <button
-            className={`nav-item ${activeTab === "submissions" ? "active" : ""}`}
-            onClick={() => {
-              setActiveTab("submissions");
-              loadSubmissions();
-            }}
-          >
-            <History size={18} /> Submissions
-          </button>
-          <button
-            className={`nav-item ${activeTab === "ai_mentor" ? "active" : ""}`}
-            onClick={() => setActiveTab("ai_mentor")}
-          >
-            <Sparkles size={18} /> AI Mentor
-          </button>
-
-          {userRole === "teacher" && (
-            <button
-              className={`nav-item ${activeTab === "teacher_workspace" ? "active" : ""}`}
-              onClick={() => {
-                setActiveTab("teacher_workspace");
-                loadProblems();
-                loadAssignments();
-                loadCodingTests();
-                loadUsers();
-              }}
-            >
-              <GraduationCap size={18} /> Teacher Workspace
-            </button>
-          )}
+          {navItems.map((item, idx) => {
+            if (item.section) {
+              return (
+                <div key={`s-${idx}`} className="nav-section-label">
+                  {item.section}
+                </div>
+              );
+            }
+            const Icon = item.icon;
+            const isActive = activeTab === item.tab && (!item.sub || teacherTab === item.sub);
+            return (
+              <button
+                key={`${item.tab}-${item.sub || ""}`}
+                className={`nav-item ${isActive ? "active" : ""}`}
+                onClick={() => navigate(item.tab, item.sub)}
+              >
+                <Icon size={18} /> {item.label}
+              </button>
+            );
+          })}
         </nav>
 
         <div className="sidebar-footer">
           <div className="user-badge">
-            <div className="user-avatar">
-              {currentUser?.name ? currentUser.name.charAt(0).toUpperCase() : "U"}
-            </div>
+            <div className="user-avatar">{currentUser.name.charAt(0).toUpperCase()}</div>
             <div className="user-info">
-              <span className="user-name">{currentUser?.name || "Code Clan User"}</span>
-              <span className="user-role-tag">{userRole} (Active Session)</span>
+              <span className="user-name">{currentUser.name}</span>
+              <span className="user-role-tag">{userRole}</span>
             </div>
+            <button className="logout-btn" onClick={onLogout} title="Log out">
+              <LogOut size={18} />
+            </button>
           </div>
         </div>
       </aside>
@@ -828,34 +856,17 @@ export default function App() {
       {/* MAIN VIEWPORT */}
       <div className="main-wrapper">
         <header className="top-navbar">
-          <div className="page-title">
-            {activeTab === "practice" && "Coding Practice & Workspace"}
-            {activeTab === "dashboard" && "Student Overview Dashboard"}
-            {activeTab === "assignments" && "Coursework & Practical Assignments"}
-            {activeTab === "coding_tests" && "Coding Tests"}
-            {activeTab === "leaderboard" && "Department Leaderboard"}
-            {activeTab === "competitions" && "Coding Competitions & Hackathons"}
-            {activeTab === "submissions" && "Global Submission Records"}
-            {activeTab === "ai_mentor" && "AI Mentor & Tutor Assistance"}
-            {activeTab === "teacher_workspace" && "Teacher Course Management"}
-          </div>
+          <div className="page-title">{pageTitle}</div>
 
           <div className="top-actions">
-            {/* Demo Role Switcher */}
-            <div className="role-switcher">
-              <button
-                className={`role-btn ${userRole === "student" ? "active" : ""}`}
-                onClick={() => setUserRole("student")}
-              >
-                Student View
-              </button>
-              <button
-                className={`role-btn ${userRole === "teacher" ? "active" : ""}`}
-                onClick={() => setUserRole("teacher")}
-              >
-                Teacher View
-              </button>
-            </div>
+            <span className={`role-pill ${roleKey}`}>
+              {isTeacher ? <GraduationCap size={14} /> : <BookOpen size={14} />}
+              {isTeacher ? "Teacher Workspace" : "Student Workspace"}
+            </span>
+            <span style={{ fontSize: 13, color: "var(--text-muted)" }}>{currentUser.email}</span>
+            <button className="btn btn-outline btn-sm" onClick={onLogout}>
+              <LogOut size={14} /> Log out
+            </button>
           </div>
         </header>
 
@@ -881,172 +892,19 @@ export default function App() {
           )}
 
           {/* ========================================================= */}
-          {/* 1. STUDENT DASHBOARD */}
+          {/* 1. ROLE-BASED DASHBOARD */}
           {/* ========================================================= */}
-          {activeTab === "dashboard" && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 24 }}>
-              <div
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
-                  gap: 16,
-                }}
-              >
-                <div className="card">
-                  <div style={{ color: "var(--text-muted)", fontSize: 13, marginBottom: 6 }}>
-                    Total Problems Solved
-                  </div>
-                  <div style={{ fontSize: 28, fontWeight: 700, color: "var(--primary)" }}>
-                    {submissions.filter((s) => s.status === "Accepted").length}
-                  </div>
-                  <div style={{ fontSize: 12, color: "var(--text-light)", marginTop: 4 }}>
-                    From {problems.length} total available
-                  </div>
-                </div>
-
-                <div className="card">
-                  <div style={{ color: "var(--text-muted)", fontSize: 13, marginBottom: 6 }}>
-                    Recorded Submissions
-                  </div>
-                  <div style={{ fontSize: 28, fontWeight: 700, color: "#10b981" }}>
-                    {submissions.length}
-                  </div>
-                  <div style={{ fontSize: 12, color: "var(--text-light)", marginTop: 4 }}>
-                    Logged in MySQL database
-                  </div>
-                </div>
-
-                <div className="card">
-                  <div style={{ color: "var(--text-muted)", fontSize: 13, marginBottom: 6 }}>
-                    Coding Tests Completed
-                  </div>
-                  <div
-                    style={{
-                      fontSize: 28,
-                      fontWeight: 700,
-                      color: "#f59e0b",
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 8,
-                    }}
-                  >
-                    <Clock size={24} /> {myLeaderboardEntry ? myLeaderboardEntry.tests_completed : 0} Tests
-                  </div>
-                  <div style={{ fontSize: 12, color: "var(--text-light)", marginTop: 4 }}>
-                    +10 XP earned per completed test
-                  </div>
-                </div>
-
-                <div className="card">
-                  <div style={{ color: "var(--text-muted)", fontSize: 13, marginBottom: 6 }}>
-                    Earned Test XP
-                  </div>
-                  <div
-                    style={{
-                      fontSize: 28,
-                      fontWeight: 700,
-                      color: "#8b5cf6",
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 8,
-                    }}
-                  >
-                    <Zap size={24} /> {myLeaderboardEntry ? `${myLeaderboardEntry.xp} XP` : "0 XP"}
-                  </div>
-                  <div style={{ fontSize: 12, color: "var(--text-light)", marginTop: 4 }}>
-                    Total XP from coding tests
-                  </div>
-                </div>
-
-                <div
-                  className="card"
-                  style={{ cursor: "pointer" }}
-                  onClick={() => {
-                    setActiveTab("leaderboard");
-                    loadLeaderboardData();
-                  }}
-                >
-                  <div style={{ color: "var(--text-muted)", fontSize: 13, marginBottom: 6 }}>
-                    My Leaderboard Rank
-                  </div>
-                  <div
-                    style={{
-                      fontSize: 28,
-                      fontWeight: 700,
-                      color: "#2563eb",
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 8,
-                    }}
-                  >
-                    <Award size={24} /> {myLeaderboardEntry ? `#${myLeaderboardEntry.rank}` : "—"}
-                    {myLeaderboardEntry && leaderboard.length > 0 && (
-                      <span style={{ fontSize: 13, fontWeight: 600, color: "var(--text-muted)" }}>
-                        of {leaderboard.length}
-                      </span>
-                    )}
-                  </div>
-                  <div style={{ fontSize: 12, color: "var(--text-light)", marginTop: 4 }}>
-                    Ranked live on department leaderboard
-                  </div>
-                </div>
-              </div>
-
-              {/* Recent activity card */}
-              <div className="card">
-                <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 16 }}>
-                  Recent Submissions
-                </h3>
-                {submissions.length === 0 ? (
-                  <p style={{ color: "var(--text-muted)", fontSize: 14 }}>
-                    No submissions found yet. Visit the Practice section to write and submit code!
-                  </p>
-                ) : (
-                  <div className="table-container">
-                    <table className="clan-table">
-                      <thead>
-                        <tr>
-                          <th>ID</th>
-                          <th>Problem</th>
-                          <th>Language</th>
-                          <th>Status</th>
-                          <th>Context</th>
-                          <th>Submitted At</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {submissions.slice(0, 5).map((s) => (
-                          <tr key={s.id}>
-                            <td>#{s.id}</td>
-                            <td style={{ fontWeight: 600 }}>{s.problem_title}</td>
-                            <td style={{ textTransform: "capitalize" }}>{s.language}</td>
-                            <td>
-                              <span
-                                className={`badge ${
-                                  s.status === "Accepted"
-                                    ? "badge-status-accepted"
-                                    : "badge-status-pending"
-                                }`}
-                              >
-                                {s.status}
-                              </span>
-                            </td>
-                            <td style={{ textTransform: "capitalize" }}>{s.submission_type}</td>
-                            <td>{new Date(s.submitted_at).toLocaleString()}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
+          {activeTab === "dashboard" &&
+            (isTeacher ? (
+              <TeacherDashboard currentUser={currentUser} usersList={usersList} onNavigate={navigate} />
+            ) : (
+              <StudentDashboard currentUser={currentUser} onNavigate={navigate} />
+            ))}
 
           {/* ========================================================= */}
           {/* 2. PRACTICE CODING WORKSPACE */}
           {/* ========================================================= */}
-          {activeTab === "practice" && (
+          {!isTeacher && activeTab === "practice" && (
             <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
               <div className="practice-layout">
                 {/* Problem List & Filter Catalog (Left Panel) */}
@@ -1335,7 +1193,7 @@ export default function App() {
           {/* ========================================================= */}
           {/* 3. ASSIGNMENTS */}
           {/* ========================================================= */}
-          {activeTab === "assignments" && (
+          {!isTeacher && activeTab === "assignments" && (
             <div className="card">
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
                 <div>
@@ -1353,7 +1211,7 @@ export default function App() {
 
               {assignments.length === 0 ? (
                 <div style={{ textAlign: "center", padding: "40px 0", color: "var(--text-muted)" }}>
-                  No assignments created yet. Switch to Teacher View to assign coursework!
+                  No assignments have been assigned to you yet. Your teachers' coursework will show up here.
                 </div>
               ) : (
                 <div className="table-container">
@@ -1429,7 +1287,7 @@ export default function App() {
           {/* ========================================================= */}
           {/* 4. CODING TESTS & LEADERBOARD SECTION */}
           {/* ========================================================= */}
-          {activeTab === "coding_tests" && (
+          {!isTeacher && activeTab === "coding_tests" && (
             <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
               {/* IF ACTIVE TEST SESSION IS RUNNING, SHOW SECURE PROCTORED TEST ENVIRONMENT */}
               {activeTestSession ? (
@@ -1856,7 +1714,7 @@ export default function App() {
 
                   {codingTests.length === 0 ? (
                     <div style={{ textAlign: "center", padding: "40px 0", color: "var(--text-muted)" }}>
-                      No coding tests published yet. Switch to Teacher View to design a new test!
+                      No coding tests published yet. Check back once your teachers publish one.
                     </div>
                   ) : (
                     <div className="table-container">
@@ -1923,6 +1781,11 @@ export default function App() {
                               </td>
                               <td>
                                 <div style={{ display: "flex", gap: 8 }}>
+                                  {["submitted", "completed"].includes(t.my_status) ? (
+                                    <span className="badge badge-easy" style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                                      <CheckCircle2 size={13} /> Completed
+                                    </span>
+                                  ) : (
                                   <button
                                     className="btn btn-primary"
                                     style={{
@@ -1938,6 +1801,7 @@ export default function App() {
                                   >
                                     <Play size={14} /> Start Test ({t.duration}m)
                                   </button>
+                                  )}
                                 </div>
                               </td>
                             </tr>
@@ -2076,7 +1940,7 @@ export default function App() {
                       <tbody>
                         {leaderboard.map((entry) => {
                           const isCurrentUser =
-                            entry.user_id === (currentUser?.id || (usersList[0]?.id || 1));
+                            entry.user_id === currentUser.id;
                           return (
                             <tr
                               key={entry.user_id}
@@ -2206,9 +2070,13 @@ export default function App() {
             <div className="card">
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
                 <div>
-                  <h3 style={{ fontSize: 18, fontWeight: 700 }}>Verified Submissions Database</h3>
+                  <h3 style={{ fontSize: 18, fontWeight: 700 }}>
+                    {isTeacher ? `Class Submissions (${submissions.length})` : `My Submissions (${submissions.length})`}
+                  </h3>
                   <p style={{ color: "var(--text-muted)", fontSize: 13 }}>
-                    Live records retrieved directly from the MySQL <code>submissions</code> table.
+                    {isTeacher
+                      ? "Every code submission made by students across practice, assignments and tests."
+                      : "All of the solutions you've submitted."}
                   </p>
                 </div>
                 <button className="btn btn-outline" onClick={loadSubmissions}>
@@ -2226,7 +2094,7 @@ export default function App() {
                     <thead>
                       <tr>
                         <th>Sub ID</th>
-                        <th>Student</th>
+                        {isTeacher && <th>Student</th>}
                         <th>Problem Title</th>
                         <th>Language</th>
                         <th>Evaluation Status</th>
@@ -2239,7 +2107,7 @@ export default function App() {
                       {submissions.map((sub) => (
                         <tr key={sub.id}>
                           <td>#{sub.id}</td>
-                          <td>User #{sub.user_id}</td>
+                          {isTeacher && <td style={{ fontWeight: 600 }}>{userName(sub.user_id)}</td>}
                           <td style={{ fontWeight: 600 }}>{sub.problem_title}</td>
                           <td style={{ textTransform: "capitalize" }}>{sub.language}</td>
                           <td>
@@ -2314,37 +2182,12 @@ export default function App() {
           )}
 
           {/* ========================================================= */}
-          {/* 8. TEACHER WORKSPACE */}
+          {/* 8. TEACHER WORKSPACE (teachers only) */}
           {/* ========================================================= */}
-          {activeTab === "teacher_workspace" && (
+          {isTeacher && activeTab === "students" && <StudentRoster />}
+
+          {isTeacher && activeTab === "teacher_workspace" && (
             <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-              {/* Teacher Sub-navigation tabs */}
-              <div style={{ display: "flex", gap: 12, borderBottom: "1px solid var(--border-light)", paddingBottom: 12, flexWrap: "wrap" }}>
-                <button
-                  className={`btn ${teacherTab === "create_problem" ? "btn-primary" : "btn-outline"}`}
-                  onClick={() => setTeacherTab("create_problem")}
-                >
-                  <PlusCircle size={16} /> 1. Create Problem Statement
-                </button>
-                <button
-                  className={`btn ${teacherTab === "create_assignment" ? "btn-primary" : "btn-outline"}`}
-                  onClick={() => setTeacherTab("create_assignment")}
-                >
-                  <BookOpen size={16} /> 2. Assign to Students
-                </button>
-                <button
-                  className={`btn ${teacherTab === "create_test" ? "btn-primary" : "btn-outline"}`}
-                  onClick={() => setTeacherTab("create_test")}
-                >
-                  <Clock size={16} /> 3. Design Coding Test
-                </button>
-                <button
-                  className={`btn ${teacherTab === "manage" ? "btn-primary" : "btn-outline"}`}
-                  onClick={() => setTeacherTab("manage")}
-                >
-                  <Users size={16} /> 4. Manage Activities ({assignments.length + codingTests.length})
-                </button>
-              </div>
 
               {/* TAB 1: CREATE PROBLEM STATEMENT */}
               {teacherTab === "create_problem" && (

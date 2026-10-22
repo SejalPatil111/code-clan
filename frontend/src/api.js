@@ -1,121 +1,180 @@
 const API_BASE = "/api";
+const TOKEN_KEY = "codeclan_token";
+const USER_KEY = "codeclan_user";
 
-export async function fetchUsers(role = null) {
-  const url = role ? `${API_BASE}/users?role=${role}` : `${API_BASE}/users`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error("Failed to fetch users");
-  return res.json();
+// =========================================================
+// SESSION HELPERS
+// =========================================================
+
+export function getStoredSession() {
+  const token = localStorage.getItem(TOKEN_KEY);
+  const userRaw = localStorage.getItem(USER_KEY);
+  if (!token || !userRaw) return null;
+  try {
+    return { token, user: JSON.parse(userRaw) };
+  } catch {
+    return null;
+  }
 }
 
-export async function fetchProblems(filters = {}) {
-  const params = new URLSearchParams();
-  if (filters.difficulty) params.append("difficulty", filters.difficulty);
-  if (filters.topic) params.append("topic", filters.topic);
-  if (filters.search) params.append("search", filters.search);
-
-  const url = `${API_BASE}/problems${params.toString() ? `?${params.toString()}` : ""}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error("Failed to fetch problems");
-  return res.json();
+export function storeSession(token, user) {
+  localStorage.setItem(TOKEN_KEY, token);
+  localStorage.setItem(USER_KEY, JSON.stringify(user));
 }
 
-export async function fetchProblemById(id) {
-  const res = await fetch(`${API_BASE}/problems/${id}`);
-  if (!res.ok) throw new Error("Failed to fetch problem details");
-  return res.json();
+export function clearSession() {
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(USER_KEY);
 }
 
-export async function createProblem(problemData) {
-  const res = await fetch(`${API_BASE}/problems`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(problemData),
+// Called when the API rejects the token (expired / invalid) so the UI can log out.
+let unauthorizedHandler = null;
+export function setUnauthorizedHandler(fn) {
+  unauthorizedHandler = fn;
+}
+
+async function request(path, { method = "GET", body, errorMessage = "Request failed" } = {}) {
+  const headers = {};
+  const token = localStorage.getItem(TOKEN_KEY);
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+
+  const res = await fetch(`${API_BASE}${path}`, {
+    method,
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
   });
+
   if (!res.ok) {
     const errorData = await res.json().catch(() => ({}));
-    throw new Error(errorData.detail || "Failed to create problem");
+    if (res.status === 401 && token && unauthorizedHandler) unauthorizedHandler();
+    const detail = Array.isArray(errorData.detail)
+      ? errorData.detail.map((d) => d.msg).join(", ")
+      : errorData.detail;
+    throw new Error(detail || errorMessage);
   }
   return res.json();
 }
 
-export async function fetchSubmissions(filters = {}) {
-  const params = new URLSearchParams();
-  if (filters.user_id) params.append("user_id", filters.user_id);
-  if (filters.problem_id) params.append("problem_id", filters.problem_id);
-  if (filters.submission_type) params.append("submission_type", filters.submission_type);
-
-  const url = `${API_BASE}/submissions${params.toString() ? `?${params.toString()}` : ""}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error("Failed to fetch submissions");
-  return res.json();
-}
-
-export async function createSubmission(submissionData) {
-  const res = await fetch(`${API_BASE}/submissions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(submissionData),
+function withQuery(path, params) {
+  const qs = new URLSearchParams();
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== undefined && v !== null && v !== "") qs.append(k, v);
   });
-  if (!res.ok) {
-    const errorData = await res.json().catch(() => ({}));
-    throw new Error(errorData.detail || "Failed to record submission");
-  }
-  return res.json();
+  const s = qs.toString();
+  return s ? `${path}?${s}` : path;
 }
 
-export async function fetchAssignments(filters = {}) {
-  const params = new URLSearchParams();
-  if (filters.student_id) params.append("student_id", filters.student_id);
-  if (filters.created_by) params.append("created_by", filters.created_by);
+// =========================================================
+// AUTH
+// =========================================================
 
-  const url = `${API_BASE}/assignments${params.toString() ? `?${params.toString()}` : ""}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error("Failed to fetch assignments");
-  return res.json();
+export function login(email, password) {
+  return request("/auth/login", { method: "POST", body: { email, password }, errorMessage: "Login failed" });
 }
 
-export async function createAssignment(assignmentData) {
-  const res = await fetch(`${API_BASE}/assignments`, {
+export function register({ name, email, password, role }) {
+  return request("/auth/register", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(assignmentData),
+    body: { name, email, password, role },
+    errorMessage: "Registration failed",
   });
-  if (!res.ok) {
-    const errorData = await res.json().catch(() => ({}));
-    throw new Error(errorData.detail || "Failed to create assignment");
-  }
-  return res.json();
 }
 
-export async function fetchCodingTests() {
-  const res = await fetch(`${API_BASE}/coding-tests`);
-  if (!res.ok) throw new Error("Failed to fetch coding tests");
-  return res.json();
+export function fetchMe() {
+  return request("/auth/me", { errorMessage: "Session expired" });
 }
 
-export async function createCodingTest(testData) {
-  const res = await fetch(`${API_BASE}/coding-tests`, {
+// =========================================================
+// CORE RESOURCES
+// =========================================================
+
+export function fetchUsers(role = null) {
+  return request(withQuery("/users", { role }), { errorMessage: "Failed to fetch users" });
+}
+
+export function fetchProblems(filters = {}) {
+  return request(
+    withQuery("/problems", { difficulty: filters.difficulty, topic: filters.topic, search: filters.search }),
+    { errorMessage: "Failed to fetch problems" }
+  );
+}
+
+export function fetchProblemById(id) {
+  return request(`/problems/${id}`, { errorMessage: "Failed to fetch problem details" });
+}
+
+export function createProblem(problemData) {
+  return request("/problems", { method: "POST", body: problemData, errorMessage: "Failed to create problem" });
+}
+
+export function fetchSubmissions(filters = {}) {
+  return request(
+    withQuery("/submissions", {
+      user_id: filters.user_id,
+      problem_id: filters.problem_id,
+      submission_type: filters.submission_type,
+    }),
+    { errorMessage: "Failed to fetch submissions" }
+  );
+}
+
+export function createSubmission(submissionData) {
+  return request("/submissions", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(testData),
+    body: submissionData,
+    errorMessage: "Failed to record submission",
   });
-  if (!res.ok) {
-    const errorData = await res.json().catch(() => ({}));
-    throw new Error(errorData.detail || "Failed to create coding test");
-  }
-  return res.json();
 }
 
-export async function completeCodingTest(testId, studentId) {
-  const res = await fetch(`${API_BASE}/coding-tests/${testId}/complete?student_id=${studentId}`, {
+export function fetchAssignments(filters = {}) {
+  return request(
+    withQuery("/assignments", { student_id: filters.student_id, created_by: filters.created_by }),
+    { errorMessage: "Failed to fetch assignments" }
+  );
+}
+
+export function createAssignment(assignmentData) {
+  return request("/assignments", {
     method: "POST",
+    body: assignmentData,
+    errorMessage: "Failed to create assignment",
   });
-  if (!res.ok) throw new Error("Failed to record test completion");
-  return res.json();
 }
 
-export async function fetchLeaderboard() {
-  const res = await fetch(`${API_BASE}/leaderboard`);
-  if (!res.ok) throw new Error("Failed to fetch leaderboard");
-  return res.json();
+export function fetchCodingTests(filters = {}) {
+  return request(withQuery("/coding-tests", { student_id: filters.student_id }), {
+    errorMessage: "Failed to fetch coding tests",
+  });
+}
+
+export function createCodingTest(testData) {
+  return request("/coding-tests", { method: "POST", body: testData, errorMessage: "Failed to create coding test" });
+}
+
+export function completeCodingTest(testId, studentId) {
+  return request(`/coding-tests/${testId}/complete?student_id=${studentId}`, {
+    method: "POST",
+    errorMessage: "Failed to record test completion",
+  });
+}
+
+export function fetchLeaderboard() {
+  return request("/leaderboard", { errorMessage: "Failed to fetch leaderboard" });
+}
+
+// =========================================================
+// ROLE-BASED DASHBOARDS
+// =========================================================
+
+export function fetchTeacherOverview() {
+  return request("/teacher/overview", { errorMessage: "Failed to load teacher dashboard" });
+}
+
+export function fetchStudentRoster() {
+  return request("/teacher/students", { errorMessage: "Failed to load student roster" });
+}
+
+export function fetchStudentOverview() {
+  return request("/student/overview", { errorMessage: "Failed to load student dashboard" });
 }
