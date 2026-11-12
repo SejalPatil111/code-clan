@@ -8,7 +8,8 @@
 # MySQL     -> localhost:3307 (host port). Your Windows MySQL keeps using 3306.
 # Grader    -> internal background worker (no host port exposed)
 #
-# This is a DEVELOPMENT configuration (hot reload, bind mounts). It is not production-ready.
+# For production deployment with mandatory gVisor (runsc) and Docker Socket Proxy,
+# see docker-compose.prod.yml and scripts/install-gvisor-linux.sh.
 
 name: codeclan
 
@@ -31,6 +32,8 @@ services:
     volumes:
       # Separate, named volume: completely independent from the Windows MySQL data directory.
       - mysql_data:/var/lib/mysql
+    networks:
+      - backend_net
     healthcheck:
       # Uses TCP (127.0.0.1) so it only passes once the real server (not the init server) is up,
       # and logs in as the application user so it also proves the user/database exist.
@@ -48,6 +51,8 @@ services:
     image: codeclan-sandbox:latest
     command: ["/bin/true"]
     restart: "no"
+    networks:
+      - backend_net
 
   grader:
     build:
@@ -62,12 +67,18 @@ services:
       SQL_ECHO: "false"
       DB_CONNECT_RETRIES: ${DB_CONNECT_RETRIES:-10}
       DB_CONNECT_DELAY_SECONDS: ${DB_CONNECT_DELAY_SECONDS:-3}
+      EXECUTION_ENV: ${EXECUTION_ENV:-development}
+      SANDBOX_RUNTIME: ${SANDBOX_RUNTIME:-runsc}
+      SANDBOX_REQUIRE_GVISOR: ${SANDBOX_REQUIRE_GVISOR:-false}
+      SANDBOX_ALLOW_DEV_FALLBACK: ${SANDBOX_ALLOW_DEV_FALLBACK:-true}
       SANDBOX_IMAGE: ${SANDBOX_IMAGE:-codeclan-sandbox:latest}
       SANDBOX_RUN_TIMEOUT: ${SANDBOX_RUN_TIMEOUT:-3.0}
       SANDBOX_COMPILE_TIMEOUT: ${SANDBOX_COMPILE_TIMEOUT:-10.0}
       SANDBOX_MEMORY_MB: ${SANDBOX_MEMORY_MB:-256}
       SANDBOX_CPUS: ${SANDBOX_CPUS:-0.5}
       SANDBOX_PIDS_LIMIT: ${SANDBOX_PIDS_LIMIT:-64}
+      SANDBOX_NOFILE_LIMIT: ${SANDBOX_NOFILE_LIMIT:-64}
+      SANDBOX_FSIZE_MB: ${SANDBOX_FSIZE_MB:-16}
       GRADER_POLL_INTERVAL: ${GRADER_POLL_INTERVAL:-1.0}
       GRADER_INTERNAL_PORT: "8090"
     volumes:
@@ -75,6 +86,8 @@ services:
       # Only the isolated grader worker mounts the Docker socket to spawn ephemeral
       # sandbox containers. FastAPI and student containers never receive this socket.
       - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - backend_net
     depends_on:
       mysql:
         condition: service_healthy
@@ -101,6 +114,7 @@ services:
       SQL_ECHO: ${SQL_ECHO:-false}
       DB_CONNECT_RETRIES: ${DB_CONNECT_RETRIES:-10}
       DB_CONNECT_DELAY_SECONDS: ${DB_CONNECT_DELAY_SECONDS:-3}
+      EXECUTION_ENV: ${EXECUTION_ENV:-development}
       GRADER_URL: http://grader:8090
       INLINE_GRADING_FALLBACK: "false"
       # Windows bind mounts don't emit file events inside Linux containers; poll for --reload.
@@ -111,6 +125,9 @@ services:
       # Live code for hot reload. Values from `environment:` above override backend/.env
       # (python-dotenv never overrides variables that are already set).
       - ./backend:/app
+    networks:
+      - frontend_net
+      - backend_net
     depends_on:
       mysql:
         condition: service_healthy
@@ -133,8 +150,16 @@ services:
       # Anonymous volume: keeps the Linux node_modules from the image instead of the Windows
       # host folder. After changing package.json run: docker compose up -d --build -V frontend
       - /app/node_modules
+    networks:
+      - frontend_net
     depends_on:
       - backend
+
+networks:
+  frontend_net:
+    driver: bridge
+  backend_net:
+    driver: bridge
 
 volumes:
   mysql_data:

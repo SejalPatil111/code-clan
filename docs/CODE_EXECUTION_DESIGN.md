@@ -1,128 +1,124 @@
-# Code Execution & Automated Grading — Architecture & Security Design
+# Code Execution & Automated Grading — Architecture & Production Security Design
 
-Status: **Implemented & Verified (Phase 2)**
+Status: **Implemented & Verified (Phase 3 — Production gVisor `runsc` + Hardened Sandbox & Deployment Architecture)**
 
 ## 1. Overview
 
-Code Clan evaluates student programs using a dedicated, isolated **`grader`** worker service and ephemeral **`codeclan-sandbox:latest`** Docker containers.
+Code Clan evaluates student programs using a dedicated, isolated **`grader`** worker service and ephemeral **`codeclan-sandbox:latest`** containers.
 
 Core invariants:
 
-1. **Zero paid APIs:** All compilation and execution runs locally inside self-hosted Docker containers (no Judge0 Cloud, RapidAPI, or third-party paid services).
-2. **Never execute student code inside FastAPI:** `backend` (`FastAPI`) only validates requests, persists `Submission` rows (`status="Pending Evaluation"`), and proxies sample-run RPC requests to `grader` over the internal Docker network. `backend` does **not** mount `/var/run/docker.sock`.
-3. **Hidden test cases stay server-side:** Public endpoints (`GET /problems`, `GET /problems/{id}`, `POST /submissions/run-samples`, and student calls to `GET /submissions/{id}`) never expose hidden testcase inputs, expected outputs, or actual outputs. Students receive only aggregate hidden testcase counts (`passed / total`). Teachers can inspect full hidden testcase definitions (`GET /problems/{id}/test-cases`) and per-testcase hidden execution results (`teacher_hidden_results` on `GET /submissions/{id}`).
-4. **Real evaluation before verdicts, scores, and XP:** Submissions start at `Pending Evaluation` (`score = 0.0`). Only the `grader` worker transitions a submission to `Running` and then to a terminal verdict (`Accepted`, `Wrong Answer`, `Time Limit Exceeded`, `Runtime Error`, `Compilation Error`, or `Internal Evaluation Error`) after running all test cases.
+1. **Zero paid APIs:** All compilation and execution runs locally inside self-hosted containers (no Judge0 Cloud, RapidAPI, or third-party paid services).
+2. **Never execute student code inside FastAPI:** `backend` (`FastAPI`) only validates requests, persists `Submission` rows (`status="Pending"`), and proxies sample-run RPC requests to `grader` over the internal `backend_net` network. `backend` does **not** mount `/var/run/docker.sock` and cannot talk to the Docker daemon.
+3. **gVisor (`runsc`) User-Space Kernel Isolation + Fail-Closed Production Mode:**
+   - On supported Linux servers, every student compilation and testcase container runs with `--runtime runsc` (**gVisor**), intercepting guest system calls inside gVisor's user-space **Sentry** kernel rather than exposing the host Linux kernel directly.
+   - At startup, `SandboxExecutor` (`backend/app/grading/sandbox.py`) inspects `docker info` runtimes and executes a live verification probe (`docker run --rm --runtime=runsc ... /bin/cat /proc/version`) to confirm the gVisor Sentry kernel is active.
+   - **Fail-Closed Production Enforcement:** When `EXECUTION_ENV=production` or `SANDBOX_REQUIRE_GVISOR=true` (or `SANDBOX_ALLOW_DEV_FALLBACK=false`), if `runsc` is missing or fails verification, `SandboxExecutor` **fails closed** (`blocked=True`, `/health` returns `503`, and no student code is executed).
+   - **Honest Local Development Fallback (Windows 11 / Docker Desktop / WSL2):** When `EXECUTION_ENV=development` and `SANDBOX_ALLOW_DEV_FALLBACK=true` on Windows Docker Desktop (where `runsc` is not installed in the managed utility VM), `SandboxExecutor` falls back to hardened `runc` and explicitly reports `gvisor_verified=false`, `production_secure=false`, `fallback_active=true`, and `security_mode="DEVELOPMENT_FALLBACK_DOCKER_RUNC (NOT_PRODUCTION_SECURE)"` on `GET /execution/security-status` and in the UI badge.
+4. **Hidden test cases stay server-side:** Public endpoints (`GET /problems`, `GET /problems/{id}`, `POST /submissions/run-samples`, and student calls to `GET /submissions/{id}`) never expose hidden testcase inputs, expected outputs, or actual outputs. Students receive only aggregate hidden testcase counts (`passed / total / failed`).
+5. **Cross-student isolation:** Students cannot read or filter another student's submissions (`HTTP 403 Forbidden`).
 
 ---
 
-## 2. System Architecture
+## 2. Production Deployment Architecture
 
+```mermaid
+flowchart TB
+    subgraph PublicEdge["Public Edge / Browser"]
+        Browser["Student / Teacher Browser"]
+    end
+
+    subgraph FrontendNet["Docker Network: frontend_net"]
+        Frontend["frontend (React / Vite)"]
+    end
+
+    subgraph BackendNet["Docker Network: backend_net (internal: true in prod)"]
+        Backend["backend (FastAPI, UID 10001, read-only, NO docker.sock)"]
+        MySQL[("mysql (MySQL 8.4, port 3306 internal)")]
+        Grader["grader Worker Replicas (UID 10001, read-only, NO direct docker.sock in prod)"]
+    end
+
+    subgraph DockerProxyNet["Docker Network: docker_proxy_net (internal: true)"]
+        SocketProxy["docker-socket-proxy (ACL: CONTAINERS=1, POST=1, VOLUMES=0, EXEC=0, PRIVILEGED=0)"]
+    end
+
+    subgraph SandboxIsolation["Ephemeral gVisor Sandbox (network: none, ipc: none)"]
+        Sandbox["codeclan-sandbox:latest (--runtime=runsc, UID 65534:65534, CapEff=0, RO rootfs)"]
+    end
+
+    Browser -->|"HTTP/HTTPS (/api/*)"| Frontend
+    Frontend -->|"frontend_net :8000"| Backend
+    Backend -->|"SQLAlchemy (backend_net :3306)"| MySQL
+    Backend -->|"Internal RPC (:8090 /internal/run-samples)"| Grader
+    Grader -->|"SELECT ... FOR UPDATE SKIP LOCKED"| MySQL
+    Grader -->|"DOCKER_HOST=tcp://docker-socket-proxy:2375"| SocketProxy
+    SocketProxy -->|"Spawns ephemeral runsc container"| Sandbox
 ```
-Browser (http://localhost:5173)
-  │
-  │  /api/* proxied by Vite
-  ▼
-backend (FastAPI, python:3.11-slim, non-root UID 10001, NO docker.sock)
-  │
-  ├──► POST /submissions ──► MySQL 8.4 (`submissions` table, status='Pending Evaluation')
-  │                             ▲
-  │                             │ Poll + Atomic Claim (`SELECT ... FOR UPDATE SKIP LOCKED`)
-  │                             │ Write `submission_results` + update `submissions` & `coding_test_students`
-  │                             ▼
-  └──► POST /submissions/run-samples ──(internal HTTP :8090)──► grader (python -m app.grading.worker)
-                                                                  │
-                                                                  │ `docker run --rm -i --network none --read-only ...`
-                                                                  ▼
-                                                        codeclan-sandbox:latest
-                                                        (/usr/local/bin/sandbox-runner, UID 65534:65534)
-```
-
-### Queue & Atomic Claiming
-
-- Pending submissions live in the MySQL `submissions` table (`status = 'Pending Evaluation'`).
-- The `grader` worker polls MySQL and claims one submission at a time inside a transaction using:
-  ```sql
-  SELECT * FROM submissions
-  WHERE status = 'Pending Evaluation'
-  ORDER BY submitted_at ASC, id ASC
-  FOR UPDATE SKIP LOCKED
-  LIMIT 1
-  ```
-- Upon claiming, the worker atomically sets `status = 'Running'`, increments `attempt_count`, and records `started_at = UTC_NOW()`.
-- **Crash recovery (`recover_stale_submissions`):** Periodically (and on startup), `grader` scans for rows stuck in `Running` where `started_at` is older than `GRADER_STALE_SECONDS` (default `90s`). If `attempt_count < GRADER_MAX_ATTEMPTS` (default `3`), the submission is re-queued to `Pending Evaluation`; otherwise it is marked `Internal Evaluation Error` so no submission can remain permanently stuck.
-- Before writing new `SubmissionResult` rows, `grader` deletes any partial `SubmissionResult` rows for that `submission_id`, guaranteeing idempotency across retries.
 
 ---
 
 ## 3. Ephemeral Sandbox Security Controls
 
-Each compilation step and each testcase execution runs inside a fresh, disposable container created from `codeclan-sandbox:latest` (`backend/sandbox/Dockerfile`) with `shell=False`:
+Each compilation step and each testcase execution runs inside a brand-new, disposable container created from `codeclan-sandbox:latest` (`backend/sandbox/Dockerfile`) with `shell=False`:
 
 | Control | Flag / Mechanism | Purpose |
 |---|---|---|
-| Network isolation | `--network none` | Blocks all outbound/inbound TCP, UDP, DNS, and local network access (cannot reach `mysql`, `backend`, or the internet). |
-| Read-only rootfs | `--read-only` | Prevents modifying system binaries, libraries, or writing outside `/work`. |
-| Ephemeral workspace | `--tmpfs /work:rw,exec,nosuid,nodev,size=32m,mode=1777` | In-memory workspace wiped automatically when the container exits; no host bind mounts (`-v` is never used). |
-| Non-root user | `--user 65534:65534` (`nobody:nogroup`) | Student code runs as an unprivileged user inside the container. |
-| Capability drop | `--cap-drop ALL` | Drops all Linux capabilities (`CAP_NET_RAW`, `CAP_SYS_ADMIN`, etc.). |
-| No privilege escalation | `--security-opt no-new-privileges` | Prevents setuid/setgid binaries from escalating privileges. |
-| Memory limit | `--memory 256m --memory-swap 256m` | Caps RAM at 256 MB with zero swap; OOM kills are detected (`OOMKilled` / exit `137`). |
-| CPU limit | `--cpus 0.5` | Prevents CPU starvation on the host. |
-| Process / fork-bomb limit | `--pids-limit 64` | Caps concurrent processes/threads to contain fork bombs. |
-| Kernel RLIMITs | `sandbox_runner.py` (`resource.setrlimit`) | Sets `RLIMIT_CORE=0`, `RLIMIT_CPU`, `RLIMIT_FSIZE=16MB`, `RLIMIT_NOFILE=64`, and `RLIMIT_AS` (for native/Python processes). |
-| Environment scrubbing | `os.environ.clear()` in `sandbox_runner.py` | Only `PATH`, `HOME=/work`, `TMPDIR=/work`, `LANG=C.UTF-8`, and `PYTHONDONTWRITEBYTECODE=1` exist. Database credentials and `SECRET_KEY` are never present. |
-| Stdin isolation | `os.memfd_create` in `sandbox_runner.py` | Payload is read from pipe, written into an anonymous in-memory fd, rewound, and bound to `fd 0` before `os.execvpe` — student code never sees the JSON framing or expected output. |
-| Output truncation | Bounded stream reader (`MAX_OUTPUT_BYTES = 65536`) | Caps `stdout` and `stderr` at 64 KB each; programs flooding stdout are killed and flagged as `Runtime Error (Output Limit Exceeded)`. |
-| Wall-clock timeout | `GRADER_RUN_TIMEOUT_SEC` (default `2.5s` per test case, `10s` compile) | Kills timed-out containers with `docker rm -f <container_name>` and returns `Time Limit Exceeded`. |
+| Kernel syscall isolation | `--runtime runsc` (gVisor) | Intercepts guest syscalls in gVisor's user-space Sentry kernel on Linux production hosts; verified via `/proc/version` probe. |
+| Network isolation | `--network none` | No external internet, DNS, loopback to host, or internal Docker network (`mysql`, `backend`, `grader` unreachable). |
+| IPC isolation | `--ipc none` | Private/disabled POSIX/SysV shared memory namespace. |
+| Read-only rootfs | `--read-only` | Prevents modifying system binaries, libraries, or writing outside `/work` and `/tmp`. |
+| Ephemeral workspace | `--tmpfs /work:rw,exec,nosuid,nodev,size=32m,mode=1777` | In-memory workspace wiped when container exits; no host bind mounts (`-v` is never used). |
+| Noexec scratch `/tmp` | `--tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777` | Blocks execution of binaries/scripts dropped into `/tmp`. |
+| Non-root user | `--user 65534:65534` (`nobody:nogroup`) | Student code runs as an unprivileged UID/GID. |
+| Capability drop | `--cap-drop ALL` | Drops all Linux capabilities (`CapEff: 0000000000000000`). |
+| No privilege escalation | `--security-opt no-new-privileges` | Sets `NoNewPrivs: 1`; prevents setuid/setgid binaries from escalating privileges. |
+| Memory limit | `--memory 256m --memory-swap 256m` | Caps RAM at 256 MB with zero swap; OOM kills (`exit 137` / `MemoryError`) are caught and reported. |
+| CPU limit | `--cpus 0.5` | Prevents CPU starvation on the worker host. |
+| Process / fork-bomb limit | `--pids-limit 64`, `--ulimit nproc=64:64`, `RLIMIT_NPROC=32` | Stops fork bombs at both the cgroup (`pids.max`) and kernel RLIMIT layers. |
+| File descriptor limit | `--ulimit nofile=64:64` & `RLIMIT_NOFILE=64` | Prevents file-descriptor table exhaustion. |
+| File size & core dump limit | `--ulimit fsize=16777216:16777216`, `--ulimit core=0:0` | Prevents disk/tmpfs filling and disables core dumps. |
+| Environment scrubbing | `os.environ.clear()` in `sandbox_runner.py` | Only `PATH`, `HOME=/work`, `LANG=C.UTF-8`, and `PYTHONUNBUFFERED=1` exist. Database credentials and `SECRET_KEY` are never present. |
+| Stdin isolation | `os.memfd_create` (with unlinked `/tmp` fallback) | Payload is read from pipe, written into an anonymous fd, rewound, and bound to `fd 0` before `os.execvpe` — student code never sees the JSON framing or expected output. |
+| Output truncation | Bounded stream reader (`MAX_OUTPUT_BYTES = 65536`) | Caps `stdout` and `stderr` at 64 KB each; programs flooding stdout are killed immediately. |
+| Guaranteed cleanup | `try ... finally: docker rm -f <container_name>` | Ensures zero lingering `codeclan-sbx-*` containers after normal exit, compilation failure, OOM, output flood, or timeout. |
 
 ---
 
-## 4. Supported Languages
+## 4. Installing & Verifying gVisor (`runsc`) on a Linux Production Server
 
-| Language | Identifier | Compile Step (inside sandbox) | Execute Step (per testcase inside sandbox) |
-|---|---|---|---|
-| **Python 3.11** | `python` | `python3 -I -B -m py_compile /work/solution.py` | `python3 -I -B /work/solution.py` |
-| **C (C11)** | `c` | `gcc -O2 -std=c11 -pipe /work/solution.c -lm -o /work/solution.out` | `/work/solution.out` |
-| **C++ (C++17)** | `cpp` | `g++ -O2 -std=c++17 -pipe /work/solution.cpp -lm -o /work/solution.out` | `/work/solution.out` |
-| **Java (OpenJDK)** | `java` | `javac -encoding UTF-8 -d /work /work/Main.java` (packaged to `solution.jar`) | `java -Xmx192m -XX:+UseSerialGC -cp /work Main` |
-| **JavaScript (Node.js)** | `javascript` | `node --check /work/solution.js` | `node --max-old-space-size=192 /work/solution.js` |
+### Step 1: Install and Register `runsc`
+On an Ubuntu/Debian x86_64 or arm64 server with Docker installed, run:
+```bash
+sudo bash scripts/install-gvisor-linux.sh
+```
 
-Compiled artifacts (`/work/solution.out` or `/work/solution.jar`) are produced once per submission in a dedicated compile sandbox container, base64-transferred in memory to the worker, and injected into `/work` for each testcase run container.
+### Step 2: Verify `runsc` is Registered and Active
+1. Confirm `runsc` appears in Docker's runtime map:
+   ```bash
+   docker info --format '{{json .Runtimes}}'
+   ```
+   Expected output includes `"runsc":{"path":"runsc"}`.
+2. Verify the container runs inside gVisor's user-space Sentry kernel (not the host Linux kernel):
+   ```bash
+   uname -r
+   docker run --rm --runtime=runsc codeclan-sandbox:latest /bin/cat /proc/version
+   docker run --rm --runtime=runsc alpine dmesg | head -n 5
+   ```
+   - `cat /proc/version` inside `--runtime=runsc` prints `Linux version 4.4.0 ...` (gVisor's synthesized kernel version) instead of the host's kernel version.
+   - `dmesg` inside `--runtime=runsc` begins with `Starting gVisor...`.
+3. Verify CodeClan's live runtime endpoint:
+   ```bash
+   curl -s http://localhost:8000/execution/security-status | python3 -m json.tool
+   ```
+   Expected fields on a production Linux + gVisor server:
+   - `"active_runtime": "runsc"`
+   - `"gvisor_verified": true`
+   - `"production_secure": true`
+   - `"fallback_active": false`
+   - `"security_mode": "PRODUCTION_GVISOR_RUNSC_VERIFIED"`
 
----
-
-## 5. Output Comparison Policy
-
-Implemented in [`backend/app/grading/comparison.py`](../backend/app/grading/comparison.py):
-
-1. Convert `\r\n` and `\r` line endings to `\n`.
-2. Strip trailing spaces and tabs (`[ \t]+`) from the end of each line.
-3. Strip trailing empty lines at the end of the output.
-4. Preserve leading whitespace, internal whitespace, and character case.
-
----
-
-## 6. Scoring & XP Formula
-
-- **Submission Score:**
-  $$\text{score} = \text{round}\left(\text{max\_score} \times \frac{\text{passed\_count}}{\text{total\_count}},\, 2\right)$$
-  - Practice and assignment problems default to `max_score = 10.0`.
-  - Coding-test problems use `CodingTestProblem.marks` (default `10.0`).
-- **Coding Test Total Score:**
-  - For each problem in a coding test, the student's **best evaluated score** among their `coding_test` submissions for that test is summed and saved in `CodingTestStudent.score`.
-- **Student XP (`_compute_student_xp_and_stats`):**
-  - **Practice / Assignment XP:** Sum of $\text{round}(10 \times \text{best\_pass\_ratio})$ across each distinct problem the student has evaluated outside coding tests.
-  - **Coding Test XP:** Sum of $\text{round}(\text{best\_problem\_score})$ across each distinct coding-test problem the student has evaluated.
-  - **Idempotency:** XP is computed deterministically from evaluated pass ratios and best problem scores. Re-submitting the same problem, retrying a worker job, or calling `POST /coding-tests/{id}/complete` multiple times never inflates XP. Submitting ungraded or zero-pass code awards `0 XP`.
-
----
-
-## 7. Remaining Risks & Production Hardening Notes
-
-While this architecture isolates student code from FastAPI, MySQL, and other students' submissions, **Docker containers share the host Linux kernel**:
-
-- **`grader` Docker socket access:** The `grader` container mounts `/var/run/docker.sock` so it can launch sibling `codeclan-sandbox:latest` containers. Although `backend`, `frontend`, and `sandbox` do **not** have access to the Docker socket, a compromise of the `grader` process itself would grant access to the Docker daemon.
-- **Recommended production upgrades:**
-  1. Run `grader` on a dedicated isolated VM/host separate from the MySQL database and FastAPI server.
-  2. Place a read/create-restricted Docker socket proxy (e.g. `tecnativa/docker-socket-proxy`) or use rootless Docker/Podman.
-  3. Use a kernel-isolating container runtime (`--runtime=runsc` with **gVisor** or **Firecracker** microVMs) for untrusted public internet workloads.
+### Step 3: Start the Production Stack
+```bash
+docker compose -f docker-compose.prod.yml up -d --build
+```
+*(In `docker-compose.prod.yml`, `EXECUTION_ENV=production`, `SANDBOX_REQUIRE_GVISOR=true`, and `SANDBOX_ALLOW_DEV_FALLBACK=false` are enforced automatically.)*

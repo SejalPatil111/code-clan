@@ -291,10 +291,26 @@ Code Clan includes a full, self-hosted code execution and automated grading syst
 
 Full architecture and security details are documented in [docs/CODE_EXECUTION_DESIGN.md](docs/CODE_EXECUTION_DESIGN.md).
 
-### Development vs Production Security Notes
+### Production gVisor (`runsc`) Isolation & Local Development Fallback (Phase 3)
 
-- **Sandbox isolation:** Every student run executes with `--network none`, `--read-only` rootfs, `--tmpfs /work:rw,exec,nosuid,nodev,size=32m`, `--memory 256m --memory-swap 256m`, `--cpus 0.5`, `--pids-limit 64`, `--cap-drop ALL`, `--security-opt no-new-privileges`, `--user 65534:65534`, scrubbed environment variables, 64 KB output caps, and wall-clock timeouts.
-- **Remaining Docker trade-offs:** Because `grader` mounts `/var/run/docker.sock` to spawn sibling sandbox containers and standard Docker containers share the host kernel, a public internet deployment should run `grader` on a dedicated worker VM, restrict socket API calls via a Docker socket proxy, and use a sandboxed runtime such as **gVisor (`runsc`)** or **Firecracker microVMs**.
+- **gVisor (`runsc`) User-Space Kernel Isolation:**
+  - In production (`docker-compose.prod.yml`), student code executes inside **`--runtime=runsc` (gVisor)** sandboxes so guest system calls are intercepted by gVisor's user-space Sentry kernel rather than the host Linux kernel.
+  - At startup, `SandboxExecutor` (`backend/app/grading/sandbox.py`) verifies both `docker info` runtimes and a live probe container (`cat /proc/version`) to confirm the gVisor Sentry kernel is active.
+  - **Fail-Closed Production Enforcement:** When `EXECUTION_ENV=production` or `SANDBOX_REQUIRE_GVISOR=true` (or `SANDBOX_ALLOW_DEV_FALLBACK=false`), if `runsc` is missing or fails verification, `grader` **fails closed** (`blocked=true`, `/health` returns `503`, and student code execution is blocked).
+- **Windows 11 + Docker Desktop Local Development Fallback:**
+  - Because Windows Docker Desktop's managed Linux utility VM only registers `runc` (not `runsc`), local development (`docker-compose.yml`, `EXECUTION_ENV=development`, `SANDBOX_ALLOW_DEV_FALLBACK=true`) automatically falls back to hardened `runc` containers and clearly reports `gvisor_verified=false`, `production_secure=false`, and `security_mode="DEVELOPMENT_FALLBACK_DOCKER_RUNC (NOT_PRODUCTION_SECURE)"` on `GET /execution/security-status` and in the UI header badge.
+- **Docker Socket Proxy (`docker-socket-proxy`) & Network Segmentation:**
+  - `docker-compose.yml` segments `frontend_net` and `backend_net`.
+  - `docker-compose.prod.yml` adds an internal `docker_proxy_net` with `tecnativa/docker-socket-proxy` (`CONTAINERS=1, POST=1, VOLUMES=0, EXEC=0, BUILD=0, SWARM=0`) so `grader` never mounts `/var/run/docker.sock` directly.
+- **Installing gVisor on a Linux Server & Running Security Tests:**
+  ```bash
+  # On Ubuntu/Debian production server:
+  sudo bash scripts/install-gvisor-linux.sh
+  docker compose -f docker-compose.prod.yml up -d --build
+
+  # Run the 14-check automated security verification suite:
+  python backend/tests/test_security_verification.py
+  ```
 
 ## Feature status
 

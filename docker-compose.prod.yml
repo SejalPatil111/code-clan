@@ -1,0 +1,214 @@
+# =============================================================================
+# CodeClan Production Deployment Compose (Linux Host with gVisor `runsc`)
+#
+# Key Production Hardening Differences from docker-compose.yml:
+#   1. Mandatory gVisor (`runsc`) isolation (`EXECUTION_ENV=production`,
+#      `SANDBOX_REQUIRE_GVISOR=true`, `SANDBOX_ALLOW_DEV_FALLBACK=false`).
+#      If `runsc` is not registered or fails Sentry kernel verification, the
+#      grader worker fails closed (`503` unhealthy) and refuses to run code.
+#   2. Docker Socket Proxy (`docker-socket-proxy`): The grader does NOT mount
+#      `/var/run/docker.sock` directly. Instead, `docker-socket-proxy` mounts
+#      the socket read-only and exposes an ACL-filtered API on an internal-only
+#      network (`VOLUMES=0`, `PRIVILEGED=0`, `EXEC=0`, `BUILD=0`, `SWARM=0`).
+#   3. Strict Network Segmentation:
+#      - `frontend_net`: frontend <-> backend
+#      - `backend_net` (`internal: true`): backend <-> mysql, grader <-> mysql
+#      - `docker_proxy_net` (`internal: true`): grader <-> docker-socket-proxy
+#      - Student sandboxes always run with `--network none` and `--ipc none`.
+#   4. No source-code bind mounts (`./backend`, `./frontend`) and no `--reload`.
+#   5. Horizontal scaling ready (`docker compose -f docker-compose.prod.yml up -d --scale grader=3`).
+# =============================================================================
+
+name: codeclan-prod
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: always
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-codeclan}
+      MYSQL_USER: ${MYSQL_USER:-codeclan_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
+      TZ: ${TZ:-UTC}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - backend_net
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$$MYSQL_PASSWORD\" mysql -h 127.0.0.1 -u \"$$MYSQL_USER\" -e 'SELECT 1' \"$$MYSQL_DATABASE\" > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+  sandbox:
+    build:
+      context: ./backend/sandbox
+    image: codeclan-sandbox:latest
+    command: ["/bin/true"]
+    restart: "no"
+    networks:
+      - backend_net
+
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    restart: always
+    environment:
+      # Allowed operations for spawning/inspecting/removing ephemeral sandbox containers
+      INFO: 1
+      PING: 1
+      VERSION: 1
+      CONTAINERS: 1
+      IMAGES: 1
+      POST: 1
+      # Blocked operations (prevents host volume mounts, exec, image builds, swarm, etc.)
+      AUTH: 0
+      BUILD: 0
+      COMMIT: 0
+      CONFIGS: 0
+      DISTRIBUTION: 0
+      EXEC: 0
+      GRPC: 0
+      NETWORKS: 0
+      NODES: 0
+      PLUGINS: 0
+      SECRETS: 0
+      SERVICES: 0
+      SESSION: 0
+      SWARM: 0
+      SYSTEM: 0
+      TASKS: 0
+      VOLUMES: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - docker_proxy_net
+    read_only: true
+    tmpfs:
+      - /run
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  grader:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.grader
+    restart: always
+    environment:
+      DATABASE_URL: mysql+pymysql://${MYSQL_USER:-codeclan_user}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-codeclan}?charset=utf8mb4
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env}
+      SQL_ECHO: "false"
+      DB_CONNECT_RETRIES: ${DB_CONNECT_RETRIES:-15}
+      DB_CONNECT_DELAY_SECONDS: ${DB_CONNECT_DELAY_SECONDS:-3}
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+      EXECUTION_ENV: "production"
+      SANDBOX_RUNTIME: "runsc"
+      SANDBOX_REQUIRE_GVISOR: "true"
+      SANDBOX_ALLOW_DEV_FALLBACK: "false"
+      SANDBOX_IMAGE: ${SANDBOX_IMAGE:-codeclan-sandbox:latest}
+      SANDBOX_RUN_TIMEOUT: ${SANDBOX_RUN_TIMEOUT:-3.0}
+      SANDBOX_COMPILE_TIMEOUT: ${SANDBOX_COMPILE_TIMEOUT:-10.0}
+      SANDBOX_MEMORY_MB: ${SANDBOX_MEMORY_MB:-256}
+      SANDBOX_CPUS: ${SANDBOX_CPUS:-0.5}
+      SANDBOX_PIDS_LIMIT: ${SANDBOX_PIDS_LIMIT:-64}
+      SANDBOX_NOFILE_LIMIT: ${SANDBOX_NOFILE_LIMIT:-64}
+      SANDBOX_FSIZE_MB: ${SANDBOX_FSIZE_MB:-16}
+      GRADER_POLL_INTERVAL: ${GRADER_POLL_INTERVAL:-1.0}
+      GRADER_INTERNAL_PORT: "8090"
+    networks:
+      - backend_net
+      - docker_proxy_net
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      mysql:
+        condition: service_healthy
+      sandbox:
+        condition: service_completed_successfully
+      docker-socket-proxy:
+        condition: service_started
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  backend:
+    build:
+      context: ./backend
+    restart: always
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+    environment:
+      DATABASE_URL: mysql+pymysql://${MYSQL_USER:-codeclan_user}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-codeclan}?charset=utf8mb4
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env}
+      TOKEN_TTL_SECONDS: ${TOKEN_TTL_SECONDS:-86400}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+      SQL_ECHO: "false"
+      DB_CONNECT_RETRIES: ${DB_CONNECT_RETRIES:-15}
+      DB_CONNECT_DELAY_SECONDS: ${DB_CONNECT_DELAY_SECONDS:-3}
+      EXECUTION_ENV: "production"
+      GRADER_URL: http://grader:8090
+      INLINE_GRADING_FALLBACK: "false"
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
+    networks:
+      - frontend_net
+      - backend_net
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      mysql:
+        condition: service_healthy
+      grader:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+    restart: always
+    environment:
+      API_PROXY_TARGET: http://backend:8000
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-5173}:5173"
+    networks:
+      - frontend_net
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - backend
+
+networks:
+  frontend_net:
+    driver: bridge
+  backend_net:
+    driver: bridge
+    internal: true
+  docker_proxy_net:
+    driver: bridge
+    internal: true
+
+volumes:
+  mysql_data:

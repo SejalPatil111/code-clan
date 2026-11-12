@@ -208,3 +208,7 @@ export function fetchStudentRoster() {
 export function fetchStudentOverview() {
   return request("/student/overview", { errorMessage: "Failed to load student dashboard" });
 }
+
+export function fetchExecutionSecurityStatus() {
+  return request("/execution/security-status", { errorMessage: "Failed to load execution security status" });
+}

@@ -38,7 +38,7 @@ from app.grading.comparison import (
     TERMINAL_STATUSES,
     normalize_language,
 )
-from app.grading.sandbox import SandboxExecutor
+from app.grading.sandbox import SandboxExecutor, list_active_sandbox_containers
 from app.models import (
     AssignmentProblem,
     AssignmentStudent,
@@ -64,6 +64,14 @@ INTERNAL_TOKEN = os.getenv("SECRET_KEY", "code-clan-dev-secret-change-me")
 
 _last_heartbeat: float = time.time()
 _stop_event = threading.Event()
+_global_executor: Optional[SandboxExecutor] = None
+
+
+def _get_executor() -> SandboxExecutor:
+    global _global_executor
+    if _global_executor is None:
+        _global_executor = SandboxExecutor()
+    return _global_executor
 
 
 def get_submission_max_score(sub: Submission, db: Session) -> float:
@@ -528,10 +536,27 @@ class _InternalGraderHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def do_GET(self) -> None:
+        executor = _get_executor()
+        rt_status = executor.get_runtime_status()
         if self.path == "/health":
             age = round(time.time() - _last_heartbeat, 2)
-            ok = age < 60.0 and not _stop_event.is_set()
-            self._send_json(200 if ok else 503, {"status": "ok" if ok else "stalled", "heartbeat_age_sec": age})
+            ok = age < 60.0 and not _stop_event.is_set() and not rt_status.blocked
+            self._send_json(
+                200 if ok else 503,
+                {
+                    "status": "ok" if ok else ("blocked" if rt_status.blocked else "stalled"),
+                    "heartbeat_age_sec": age,
+                    "runtime_security": rt_status.to_dict(),
+                },
+            )
+        elif self.path == "/internal/runtime-status":
+            token = self.headers.get("X-Internal-Token", "")
+            if token != INTERNAL_TOKEN:
+                self._send_json(403, {"detail": "Forbidden"})
+                return
+            payload = rt_status.to_dict()
+            payload["active_sandbox_containers"] = list_active_sandbox_containers()
+            self._send_json(200, payload)
         else:
             self._send_json(404, {"detail": "Not found"})
 
@@ -553,6 +578,7 @@ class _InternalGraderHandler(BaseHTTPRequestHandler):
                 language=str(body["language"]),
                 code=str(body["code"]),
                 public_test_cases=list(body.get("public_test_cases", [])),
+                executor=_get_executor(),
             )
             self._send_json(200, res)
         except Exception as exc:
@@ -566,7 +592,7 @@ def run_worker_forever() -> None:
     logger.info("Waiting for database connectivity...")
     wait_for_db()
 
-    executor = SandboxExecutor()
+    executor = _get_executor()
 
     def _handle_sig(signum, _frame):
         logger.info("Received signal %s; shutting down grader worker gracefully...", signum)

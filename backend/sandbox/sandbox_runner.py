@@ -53,7 +53,7 @@ def _detect_java_class(code: str) -> str:
     return "Main"
 
 
-def _set_limits(cpu_sec: int, fsize_mb: int, memory_mb: int, is_jvm_or_node: bool = False) -> None:
+def _set_limits(cpu_sec: int, fsize_mb: int, memory_mb: int, nproc: int = 32, nofile: int = 64, is_jvm_or_node: bool = False) -> None:
     try:
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     except Exception:
@@ -68,9 +68,16 @@ def _set_limits(cpu_sec: int, fsize_mb: int, memory_mb: int, is_jvm_or_node: boo
     except Exception:
         pass
     try:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (nofile, nofile))
     except Exception:
         pass
+    if hasattr(resource, "RLIMIT_NPROC"):
+        try:
+            # JVM and Node require extra runtime threads; native/Python solutions need very few.
+            proc_cap = max(nproc, 48) if is_jvm_or_node else nproc
+            resource.setrlimit(resource.RLIMIT_NPROC, (proc_cap, proc_cap))
+        except Exception:
+            pass
     # JVM and V8 map large virtual address ranges (PROT_NONE) even when physical RSS is small.
     # For native/Python processes we also cap RLIMIT_AS in addition to the Docker cgroup limit.
     if not is_jvm_or_node and memory_mb > 0:
@@ -219,6 +226,8 @@ def _handle_run(payload: dict) -> None:
     cpu_sec = int(payload.get("cpu_limit_sec", 3))
     fsize_mb = int(payload.get("fsize_limit_mb", 8))
     memory_mb = int(payload.get("memory_limit_mb", 256))
+    nproc = int(payload.get("nproc_limit", 32))
+    nofile = int(payload.get("nofile_limit", 64))
 
     os.chdir(WORKDIR)
 
@@ -272,18 +281,35 @@ def _handle_run(payload: dict) -> None:
         sys.stderr.write(f"Unsupported language: {lang}\n")
         sys.exit(2)
 
-    # Bind testcase input to fd 0 via an anonymous in-memory file descriptor
-    mem_fd = os.memfd_create("testcase_stdin", 0)
-    if stdin_bytes:
-        os.write(mem_fd, stdin_bytes)
-    os.lseek(mem_fd, 0, os.SEEK_SET)
-    os.dup2(mem_fd, 0)
-    os.close(mem_fd)
+    # Bind testcase input to fd 0 via an anonymous in-memory file descriptor (with unlinked /tmp fallback)
+    try:
+        mem_fd = os.memfd_create("testcase_stdin", 0)
+        if stdin_bytes:
+            os.write(mem_fd, stdin_bytes)
+        os.lseek(mem_fd, 0, os.SEEK_SET)
+        os.dup2(mem_fd, 0)
+        os.close(mem_fd)
+    except OSError:
+        stdin_tmp = "/tmp/.stdin_buf"
+        with open(stdin_tmp, "wb") as tf:
+            if stdin_bytes:
+                tf.write(stdin_bytes)
+        tmp_fd = os.open(stdin_tmp, os.O_RDONLY)
+        os.unlink(stdin_tmp)
+        os.dup2(tmp_fd, 0)
+        os.close(tmp_fd)
 
     # Wipe environment and apply kernel rlimits before replacing process image
     os.environ.clear()
     os.environ.update(SAFE_ENV)
-    _set_limits(cpu_sec=cpu_sec, fsize_mb=fsize_mb, memory_mb=memory_mb, is_jvm_or_node=is_jvm_or_node)
+    _set_limits(
+        cpu_sec=cpu_sec,
+        fsize_mb=fsize_mb,
+        memory_mb=memory_mb,
+        is_jvm_or_node=is_jvm_or_node,
+        nproc=nproc,
+        nofile=nofile,
+    )
 
     os.execvpe(cmd[0], cmd, SAFE_ENV)
 

@@ -50,6 +50,7 @@ import {
   createCodingTest,
   completeCodingTest,
   fetchLeaderboard,
+  fetchExecutionSecurityStatus,
 } from "./api";
 import TeacherDashboard from "./components/TeacherDashboard";
 import StudentDashboard from "./components/StudentDashboard";
@@ -230,6 +231,7 @@ export default function App({ currentUser, onLogout }) {
   const [testRunOutput, setTestRunOutput] = useState(null);
   const [isTestEvaluating, setIsTestEvaluating] = useState(false);
   const [tabSwitchAlert, setTabSwitchAlert] = useState(false);
+  const [securityStatus, setSecurityStatus] = useState(null);
 
   // Load initial data
   useEffect(() => {
@@ -239,6 +241,9 @@ export default function App({ currentUser, onLogout }) {
     loadAssignments();
     loadCodingTests();
     loadLeaderboardData();
+    fetchExecutionSecurityStatus()
+      .then((st) => setSecurityStatus(st))
+      .catch(() => {});
   }, []);
 
   const loadUsers = async () => {
@@ -1299,6 +1304,24 @@ export default function App({ currentUser, onLogout }) {
                     </div>
 
                     <div style={{ fontSize: 12, color: "var(--text-muted)", display: "flex", alignItems: "center", gap: 8 }}>
+                      {securityStatus && (
+                        <span
+                          title={securityStatus.message}
+                          style={{
+                            fontSize: 11,
+                            fontWeight: 600,
+                            padding: "2px 8px",
+                            borderRadius: 6,
+                            backgroundColor: securityStatus.gvisor_verified ? "#dcfce7" : "#fef3c7",
+                            color: securityStatus.gvisor_verified ? "#166534" : "#92400e",
+                            border: `1px solid ${securityStatus.gvisor_verified ? "#86efac" : "#fde68a"}`,
+                          }}
+                        >
+                          {securityStatus.gvisor_verified
+                            ? "🛡️ gVisor (runsc) Verified"
+                            : `⚠️ Dev Sandbox (${securityStatus.active_runtime} fallback — not prod secure)`}
+                        </span>
+                      )}
                       {activeAssignmentId ? (
                         <>
                           <span className="badge badge-easy" style={{ fontSize: 11 }}>

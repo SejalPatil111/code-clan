@@ -183,6 +183,56 @@ def health(db: Session = Depends(get_db)):
     return {"status": "ok", "database": "ok"}
 
 
+@app.get("/execution/security-status", tags=["General"])
+def execution_security_status():
+    """
+    Return verified sandbox isolation & runtime security status from the isolated
+    grader worker. Never claims gVisor (`runsc`) is active unless verified.
+    """
+    if GRADER_URL:
+        try:
+            req = urllib.request.Request(
+                f"{GRADER_URL.rstrip('/')}/internal/runtime-status",
+                headers={"X-Internal-Token": SECRET_KEY},
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            return {
+                "execution_env": os.getenv("EXECUTION_ENV", "development"),
+                "requested_runtime": "runsc",
+                "active_runtime": "unreachable",
+                "available_runtimes": [],
+                "host_kernel": "unknown",
+                "sandbox_kernel": "unknown",
+                "gvisor_verified": False,
+                "fallback_active": False,
+                "production_secure": False,
+                "blocked": True,
+                "security_mode": "GRADER_WORKER_UNREACHABLE",
+                "message": f"Isolated grader worker is unreachable: {exc}",
+                "warnings": [str(exc)],
+                "active_sandbox_containers": [],
+            }
+    return {
+        "execution_env": os.getenv("EXECUTION_ENV", "development"),
+        "requested_runtime": "runsc",
+        "active_runtime": "unconfigured",
+        "available_runtimes": [],
+        "host_kernel": "unknown",
+        "sandbox_kernel": "unknown",
+        "gvisor_verified": False,
+        "fallback_active": False,
+        "production_secure": False,
+        "blocked": True,
+        "security_mode": "GRADER_URL_NOT_CONFIGURED",
+        "message": "GRADER_URL is not configured on backend.",
+        "warnings": ["GRADER_URL is not configured."],
+        "active_sandbox_containers": [],
+    }
+
+
 # =========================================================
 # AUTH ENDPOINTS
 # =========================================================
