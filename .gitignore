@@ -1,6 +1,12 @@
 # Environment variables
 .env
 .env.*
+!.env.example
+
+# Database dumps / backups (may contain user data and password hashes)
+backups/
+*.sql
+*.sql.gz
 
 # Node
 node_modules/

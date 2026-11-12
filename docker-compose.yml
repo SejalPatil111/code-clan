@@ -1,0 +1,140 @@
+# CodeClan local development stack: React/Vite frontend, FastAPI backend, Grader worker, Sandbox image, MySQL.
+#
+#   copy .env.example .env      (then edit the passwords / secret)
+#   docker compose up -d --build
+#
+# Frontend  -> http://localhost:5173
+# API docs  -> http://localhost:8000/docs
+# MySQL     -> localhost:3307 (host port). Your Windows MySQL keeps using 3306.
+# Grader    -> internal background worker (no host port exposed)
+#
+# This is a DEVELOPMENT configuration (hot reload, bind mounts). It is not production-ready.
+
+name: codeclan
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-codeclan}
+      MYSQL_USER: ${MYSQL_USER:-codeclan_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env (see .env.example)}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env (see .env.example)}
+      TZ: ${TZ:-UTC}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    ports:
+      # Bound to localhost only, on 3307 so it never collides with the Windows MySQL service (3306).
+      - "127.0.0.1:${MYSQL_HOST_PORT:-3307}:3306"
+    volumes:
+      # Separate, named volume: completely independent from the Windows MySQL data directory.
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      # Uses TCP (127.0.0.1) so it only passes once the real server (not the init server) is up,
+      # and logs in as the application user so it also proves the user/database exist.
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$$MYSQL_PASSWORD\" mysql -h 127.0.0.1 -u \"$$MYSQL_USER\" -e 'SELECT 1' \"$$MYSQL_DATABASE\" > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+  # Builds the local `codeclan-sandbox:latest` image used by the grader to spawn
+  # ephemeral, network-isolated execution containers for Python, C, C++, Java, and JS.
+  sandbox:
+    build:
+      context: ./backend/sandbox
+    image: codeclan-sandbox:latest
+    command: ["/bin/true"]
+    restart: "no"
+
+  grader:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.grader
+    restart: unless-stopped
+    group_add:
+      - "0"
+    environment:
+      DATABASE_URL: mysql+pymysql://${MYSQL_USER:-codeclan_user}:${MYSQL_PASSWORD}@${DB_HOST:-mysql}:${DB_PORT:-3306}/${MYSQL_DATABASE:-codeclan}?charset=utf8mb4
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env (see .env.example)}
+      SQL_ECHO: "false"
+      DB_CONNECT_RETRIES: ${DB_CONNECT_RETRIES:-10}
+      DB_CONNECT_DELAY_SECONDS: ${DB_CONNECT_DELAY_SECONDS:-3}
+      SANDBOX_IMAGE: ${SANDBOX_IMAGE:-codeclan-sandbox:latest}
+      SANDBOX_RUN_TIMEOUT: ${SANDBOX_RUN_TIMEOUT:-3.0}
+      SANDBOX_COMPILE_TIMEOUT: ${SANDBOX_COMPILE_TIMEOUT:-10.0}
+      SANDBOX_MEMORY_MB: ${SANDBOX_MEMORY_MB:-256}
+      SANDBOX_CPUS: ${SANDBOX_CPUS:-0.5}
+      SANDBOX_PIDS_LIMIT: ${SANDBOX_PIDS_LIMIT:-64}
+      GRADER_POLL_INTERVAL: ${GRADER_POLL_INTERVAL:-1.0}
+      GRADER_INTERNAL_PORT: "8090"
+    volumes:
+      - ./backend:/app
+      # Only the isolated grader worker mounts the Docker socket to spawn ephemeral
+      # sandbox containers. FastAPI and student containers never receive this socket.
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      mysql:
+        condition: service_healthy
+      sandbox:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    command: ["uvicorn", "main:app", "--host", "${BACKEND_HOST:-0.0.0.0}", "--port", "8000", "--reload"]
+    environment:
+      # Service name "mysql" resolves on the Docker network; container port is 3306.
+      # Note: keep MYSQL_PASSWORD URL-safe (letters/digits/-/_) because it is embedded in this URL.
+      DATABASE_URL: mysql+pymysql://${MYSQL_USER:-codeclan_user}:${MYSQL_PASSWORD}@${DB_HOST:-mysql}:${DB_PORT:-3306}/${MYSQL_DATABASE:-codeclan}?charset=utf8mb4
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env (see .env.example)}
+      TOKEN_TTL_SECONDS: ${TOKEN_TTL_SECONDS:-86400}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+      SQL_ECHO: ${SQL_ECHO:-false}
+      DB_CONNECT_RETRIES: ${DB_CONNECT_RETRIES:-10}
+      DB_CONNECT_DELAY_SECONDS: ${DB_CONNECT_DELAY_SECONDS:-3}
+      GRADER_URL: http://grader:8090
+      INLINE_GRADING_FALLBACK: "false"
+      # Windows bind mounts don't emit file events inside Linux containers; poll for --reload.
+      WATCHFILES_FORCE_POLLING: "true"
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
+    volumes:
+      # Live code for hot reload. Values from `environment:` above override backend/.env
+      # (python-dotenv never overrides variables that are already set).
+      - ./backend:/app
+    depends_on:
+      mysql:
+        condition: service_healthy
+      grader:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    environment:
+      # The browser calls /api on the Vite server, which proxies to the backend container.
+      API_PROXY_TARGET: http://backend:8000
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
+      WATCH_POLLING: "true"
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-5173}:5173"
+    volumes:
+      - ./frontend:/app
+      # Anonymous volume: keeps the Linux node_modules from the image instead of the Windows
+      # host folder. After changing package.json run: docker compose up -d --build -V frontend
+      - /app/node_modules
+    depends_on:
+      - backend
+
+volumes:
+  mysql_data:

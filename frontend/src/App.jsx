@@ -41,7 +41,9 @@ import {
   fetchProblemById,
   createProblem,
   fetchSubmissions,
+  fetchSubmissionById,
   createSubmission,
+  runSampleCases,
   fetchAssignments,
   createAssignment,
   fetchCodingTests,
@@ -52,8 +54,26 @@ import {
 import TeacherDashboard from "./components/TeacherDashboard";
 import StudentDashboard from "./components/StudentDashboard";
 import StudentRoster from "./components/StudentRoster";
+import { StatusBadge } from "./components/ui";
 import "./App.css";
 import "./components/dashboard.css";
+
+function getLanguageTemplate(language, problemTitle = "Problem", difficulty = "", topic = "") {
+  const header = `${problemTitle}${difficulty ? ` (${difficulty})` : ""}${topic ? ` | Topic: ${topic}` : ""}`;
+  if (language === "c") {
+    return `// ${header}\n#include <stdio.h>\n\nint main(void) {\n    // Read from stdin and print to stdout\n    return 0;\n}\n`;
+  }
+  if (language === "cpp") {
+    return `// ${header}\n#include <iostream>\nusing namespace std;\n\nint main() {\n    ios::sync_with_stdio(false);\n    cin.tie(nullptr);\n    // Read from cin and print to cout\n    return 0;\n}\n`;
+  }
+  if (language === "java") {
+    return `// ${header}\nimport java.util.*;\n\npublic class Main {\n    public static void main(String[] args) {\n        Scanner sc = new Scanner(System.in);\n        // Read input and print output\n    }\n}\n`;
+  }
+  if (language === "javascript") {
+    return `// ${header}\nconst fs = require("fs");\nconst input = fs.readFileSync(0, "utf-8").trim();\n\n// Write your solution here\n`;
+  }
+  return `# ${header}\nimport sys\n\ndef solve():\n    data = sys.stdin.read().split()\n    # Write your Python 3 solution here\n\nif __name__ == "__main__":\n    solve()\n`;
+}
 
 // Sidebar navigation per role. `tab` maps to a content section; `sub` selects a
 // teacher workspace panel.
@@ -124,12 +144,17 @@ export default function App({ currentUser, onLogout }) {
   );
   const [selectedLanguage, setSelectedLanguage] = useState("python");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isRunningSamples, setIsRunningSamples] = useState(false);
+  const [sampleRunResult, setSampleRunResult] = useState(null);
   const [lastSubmissionResult, setLastSubmissionResult] = useState(null);
+  const [activeAssignmentId, setActiveAssignmentId] = useState(null);
   const [isLoadingProblems, setIsLoadingProblems] = useState(false);
   const [networkError, setNetworkError] = useState(null);
 
-  // Submissions history state
+  // Submissions history & detail review state
   const [submissions, setSubmissions] = useState([]);
+  const [selectedSubmissionDetail, setSelectedSubmissionDetail] = useState(null);
+  const [isLoadingSubmissionDetail, setIsLoadingSubmissionDetail] = useState(false);
 
   // Assignments state
   const [assignments, setAssignments] = useState([]);
@@ -155,6 +180,8 @@ export default function App({ currentUser, onLogout }) {
     examples: "",
     sample_input: "",
     sample_output: "",
+    hidden_input: "",
+    hidden_output: "",
   });
   const [isSubmittingProblem, setIsSubmittingProblem] = useState(false);
   const [formMsg, setFormMsg] = useState(null);
@@ -190,13 +217,15 @@ export default function App({ currentUser, onLogout }) {
     examples: "",
     sample_input: "",
     sample_output: "",
+    hidden_input: "",
+    hidden_output: "",
   });
   const [showAddCustomQuestion, setShowAddCustomQuestion] = useState(false);
   const [isSubmittingTest, setIsSubmittingTest] = useState(false);
   const [testFormMsg, setTestFormMsg] = useState(null);
 
   // Active Student Test Session (Proctored Environment)
-  const [activeTestSession, setActiveTestSession] = useState(null); // { test, timeRemaining, activeProblemIndex, answers: { [probId]: code }, violationWarnings: 0, status: 'in_progress' | 'submitted' }
+  const [activeTestSession, setActiveTestSession] = useState(null); // { test, problemDetails, timeRemaining, activeProblemIndex, answers: { [probId]: code }, violationWarnings: 0, status: 'in_progress' | 'submitted' }
   const [testEditorLanguage, setTestEditorLanguage] = useState("python");
   const [testRunOutput, setTestRunOutput] = useState(null);
   const [isTestEvaluating, setIsTestEvaluating] = useState(false);
@@ -288,17 +317,25 @@ export default function App({ currentUser, onLogout }) {
     }
   };
 
-  const openProblem = async (prob) => {
+  const openProblem = async (prob, langOverride = null) => {
+    const lang = langOverride || selectedLanguage;
     try {
       const fullProb = await fetchProblemById(prob.id);
       setSelectedProblem(fullProb);
       setLastSubmissionResult(null);
-      setEditorCode(
-        `# Problem: ${fullProb.title} (${fullProb.difficulty})\n# Topic: ${fullProb.topic}\n# Language: Python 3\n\ndef solution():\n    # Implement your logic here\n    pass\n`
-      );
+      setSampleRunResult(null);
+      setEditorCode(getLanguageTemplate(lang, fullProb.title, fullProb.difficulty, fullProb.topic));
     } catch (err) {
       console.error("Error fetching problem details:", err);
       setSelectedProblem(prob);
+    }
+  };
+
+  const handleLanguageChange = (newLang) => {
+    setSelectedLanguage(newLang);
+    setSampleRunResult(null);
+    if (selectedProblem) {
+      setEditorCode(getLanguageTemplate(newLang, selectedProblem.title, selectedProblem.difficulty, selectedProblem.topic));
     }
   };
 
@@ -313,6 +350,30 @@ export default function App({ currentUser, onLogout }) {
     loadProblems({ difficulty: difficultyFilter || undefined, search: val || undefined });
   };
 
+  const handleRunPracticeSamples = async () => {
+    if (!selectedProblem) return;
+    setIsRunningSamples(true);
+    setSampleRunResult(null);
+    try {
+      const res = await runSampleCases({
+        problem_id: selectedProblem.id,
+        language: selectedLanguage,
+        code: editorCode,
+      });
+      setSampleRunResult(res);
+    } catch (err) {
+      setSampleRunResult({
+        status: "Internal Evaluation Error",
+        error_message: err.message,
+        passed_count: 0,
+        total_count: 0,
+        results: [],
+      });
+    } finally {
+      setIsRunningSamples(false);
+    }
+  };
+
   const handleSubmitSolution = async () => {
     const activeUserId = currentUser.id;
     if (!selectedProblem) return;
@@ -325,7 +386,8 @@ export default function App({ currentUser, onLogout }) {
         problem_id: selectedProblem.id,
         code: editorCode,
         language: selectedLanguage,
-        submission_type: "practice",
+        submission_type: activeAssignmentId ? "assignment" : "practice",
+        assignment_id: activeAssignmentId || undefined,
       };
 
       const result = await createSubmission(payload);
@@ -338,6 +400,71 @@ export default function App({ currentUser, onLogout }) {
     }
   };
 
+  // Poll submission evaluation status while Pending Evaluation or Running
+  useEffect(() => {
+    if (
+      !lastSubmissionResult ||
+      !lastSubmissionResult.id ||
+      (lastSubmissionResult.status !== "Pending Evaluation" && lastSubmissionResult.status !== "Running")
+    ) {
+      return;
+    }
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const updated = await fetchSubmissionById(lastSubmissionResult.id);
+        setLastSubmissionResult(updated);
+        if (updated.status !== "Pending Evaluation" && updated.status !== "Running") {
+          clearInterval(pollInterval);
+          loadSubmissions();
+          loadLeaderboardData();
+        }
+      } catch (err) {
+        console.error("Error polling submission status:", err);
+      }
+    }, 1200);
+
+    return () => clearInterval(pollInterval);
+  }, [lastSubmissionResult?.id, lastSubmissionResult?.status]);
+
+  // Poll inspected submission detail while Pending Evaluation or Running
+  useEffect(() => {
+    if (
+      !selectedSubmissionDetail ||
+      !selectedSubmissionDetail.id ||
+      (selectedSubmissionDetail.status !== "Pending Evaluation" && selectedSubmissionDetail.status !== "Running")
+    ) {
+      return;
+    }
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const updated = await fetchSubmissionById(selectedSubmissionDetail.id);
+        setSelectedSubmissionDetail(updated);
+        if (updated.status !== "Pending Evaluation" && updated.status !== "Running") {
+          clearInterval(pollInterval);
+          loadSubmissions();
+        }
+      } catch (err) {
+        console.error("Error polling inspected submission:", err);
+      }
+    }, 1200);
+
+    return () => clearInterval(pollInterval);
+  }, [selectedSubmissionDetail?.id, selectedSubmissionDetail?.status]);
+
+  const handleInspectSubmission = async (subId) => {
+    setIsLoadingSubmissionDetail(true);
+    try {
+      const detail = await fetchSubmissionById(subId);
+      setSelectedSubmissionDetail(detail);
+    } catch (err) {
+      alert("Unable to load submission details: " + err.message);
+    } finally {
+      setIsLoadingSubmissionDetail(false);
+    }
+  };
+
   const handleCreateProblemSubmit = async (e) => {
     e.preventDefault();
     setFormMsg(null);
@@ -346,6 +473,21 @@ export default function App({ currentUser, onLogout }) {
     const activeUserId = currentUser.id;
 
     try {
+      const testCases = [
+        {
+          input: newProblem.sample_input || "sample_input",
+          expected_output: newProblem.sample_output || "sample_output",
+          is_hidden: false,
+        },
+      ];
+      if (newProblem.hidden_input?.trim() || newProblem.hidden_output?.trim()) {
+        testCases.push({
+          input: newProblem.hidden_input || "",
+          expected_output: newProblem.hidden_output || "",
+          is_hidden: true,
+        });
+      }
+
       const payload = {
         title: newProblem.title.trim(),
         description: newProblem.description.trim(),
@@ -356,13 +498,7 @@ export default function App({ currentUser, onLogout }) {
         constraints: newProblem.constraints?.trim() || null,
         examples: newProblem.examples?.trim() || null,
         created_by: activeUserId,
-        test_cases: [
-          {
-            input: newProblem.sample_input || "sample_input",
-            expected_output: newProblem.sample_output || "sample_output",
-            is_hidden: false,
-          },
-        ],
+        test_cases: testCases,
       };
 
       const res = await createProblem(payload);
@@ -378,6 +514,8 @@ export default function App({ currentUser, onLogout }) {
         examples: "",
         sample_input: "",
         sample_output: "",
+        hidden_input: "",
+        hidden_output: "",
       });
       await loadProblems();
     } catch (err) {
@@ -499,6 +637,8 @@ export default function App({ currentUser, onLogout }) {
       examples: "",
       sample_input: "",
       sample_output: "",
+      hidden_input: "",
+      hidden_output: "",
     });
     setShowAddCustomQuestion(false);
   };
@@ -563,10 +703,17 @@ export default function App({ currentUser, onLogout }) {
       return;
     }
 
-    // Pre-populate solution code templates for all test problems
+    // Fetch full problem details (including public sample test cases)
+    const problemDetails = {};
     const initialAnswers = {};
     for (const p of test.problems) {
-      initialAnswers[p.problem_id] = `# Test Question: ${p.title}\n# Difficulty: ${p.difficulty} | Topic: ${p.topic}\n# Language: Python 3\n\ndef solution():\n    # Write your solution code here\n    pass\n`;
+      initialAnswers[p.problem_id] = getLanguageTemplate(testEditorLanguage, p.title, p.difficulty, p.topic);
+      try {
+        const detail = await fetchProblemById(p.problem_id);
+        problemDetails[p.problem_id] = detail;
+      } catch (err) {
+        problemDetails[p.problem_id] = p;
+      }
     }
 
     // Initialize timer in seconds (duration in minutes * 60)
@@ -574,6 +721,7 @@ export default function App({ currentUser, onLogout }) {
 
     setActiveTestSession({
       test: test,
+      problemDetails,
       timeRemaining: initialSeconds,
       activeProblemIndex: 0,
       answers: initialAnswers,
@@ -654,44 +802,55 @@ export default function App({ currentUser, onLogout }) {
     };
   }, [activeTestSession?.status]);
 
-  // Run Test Samples Execution Simulator
-  const handleRunTestSampleCode = (prob) => {
-    const code = activeTestSession.answers[prob.problem_id] || "";
+  // Run Test Samples in Real Isolated Sandbox
+  const handleRunTestSampleCode = async (prob) => {
+    const probId = prob.problem_id || prob.id;
+    const code = activeTestSession.answers[probId] || "";
     setIsTestEvaluating(true);
     setTestRunOutput(null);
 
-    setTimeout(() => {
+    try {
+      const res = await runSampleCases({
+        problem_id: probId,
+        language: testEditorLanguage,
+        code,
+      });
+      const firstCase = res.results && res.results.length > 0 ? res.results[0] : null;
+      setTestRunOutput({
+        status: res.status,
+        message: res.error_message
+          ? res.error_message
+          : `${res.passed_count}/${res.total_count} sample case(s) passed in ${res.execution_time || 0} ms.`,
+        sampleInput: firstCase ? firstCase.input : "",
+        expectedOutput: firstCase ? firstCase.expected_output : "",
+        userOutput: firstCase ? firstCase.actual_output : "",
+        passed: res.status === "Accepted",
+        results: res.results || [],
+      });
+    } catch (err) {
+      setTestRunOutput({
+        status: "Evaluation Error",
+        message: err.message,
+        passed: false,
+      });
+    } finally {
       setIsTestEvaluating(false);
-      if (!code.trim() || code.includes("pass")) {
-        setTestRunOutput({
-          status: "Warning",
-          message: "Code executed with default template. Implement logic to satisfy sample cases.",
-          sampleInput: prob.sample_input || "5 10",
-          expectedOutput: prob.sample_output || "15",
-          userOutput: "None (Function body empty)",
-          passed: false,
-        });
-      } else {
-        setTestRunOutput({
-          status: "Success",
-          message: "Sample test case passed! Execution completed in 0.04s without syntax or runtime exceptions.",
-          sampleInput: prob.sample_input || "5 10",
-          expectedOutput: prob.sample_output || "15",
-          userOutput: prob.sample_output || "15",
-          passed: true,
-        });
-      }
-    }, 600);
+    }
   };
 
-  // Save / Submit Individual Problem in Active Test
+  // Save / Submit Individual Problem in Active Test & Poll Grader Verdict
   const handleSaveAndSubmitTestProblem = async (prob) => {
     const activeUserId = currentUser.id;
     const code = activeTestSession.answers[prob.problem_id] || "";
     setIsTestEvaluating(true);
+    setTestRunOutput({
+      status: "Pending Evaluation",
+      message: `Submitting "${prob.title}" to isolated grader...`,
+      passed: false,
+    });
 
     try {
-      await createSubmission({
+      const created = await createSubmission({
         user_id: activeUserId,
         problem_id: prob.problem_id,
         code: code,
@@ -700,10 +859,20 @@ export default function App({ currentUser, onLogout }) {
         coding_test_id: activeTestSession.test.id,
       });
 
+      // Poll up to 12 times (~10 seconds) for grader evaluation
+      let finalSub = created;
+      for (let i = 0; i < 12; i++) {
+        if (finalSub.status !== "Pending Evaluation" && finalSub.status !== "Running") break;
+        await new Promise((r) => setTimeout(r, 900));
+        finalSub = await fetchSubmissionById(created.id);
+      }
+
       setTestRunOutput({
-        status: "Submitted",
-        message: `Solution for "${prob.title}" saved and submitted to test records! You can proceed to next question or submit the entire exam.`,
-        passed: true,
+        status: finalSub.status,
+        message: finalSub.error_message
+          ? `${finalSub.status}: ${finalSub.error_message}`
+          : `Verdict: ${finalSub.status} • Score: ${finalSub.score || 0}/${finalSub.max_score || 10} pts (${finalSub.passed_count || 0}/${finalSub.total_count || 0} test cases passed in ${finalSub.execution_time || 0} ms).`,
+        passed: finalSub.status === "Accepted",
       });
       await loadSubmissions();
     } catch (err) {
@@ -722,17 +891,19 @@ export default function App({ currentUser, onLogout }) {
     setCompletingTestId(testId);
 
     try {
-      // Award +10 XP and mark test completed in DB
-      await completeCodingTest(testId, activeUserId);
+      const res = await completeCodingTest(testId, activeUserId);
+      const testTitle = activeTestSession.test.title;
       setActiveTestSession(null);
       setTabSwitchAlert(false);
 
       if (isAutoSubmit) {
-        alert("⏰ Time is up! Your timed coding test has been automatically submitted and +10 XP has been awarded to your profile!");
+        alert(
+          `⏰ Time is up! Your timed coding test "${testTitle}" has been submitted. Evaluated Score: ${res.score ?? 0}/${res.max_score ?? 0} pts • Total XP: ${res.xp ?? 0} XP.`
+        );
       } else {
         setTestActionMsg({
           type: "success",
-          text: `🎉 Congratulations! You completed and submitted "${activeTestSession.test.title}" before time and earned +10 XP. Check your updated rank on the Leaderboard!`,
+          text: `🎉 Test "${testTitle}" finalized! Evaluated Score: ${res.score ?? 0}/${res.max_score ?? 0} pts • Your Total XP is now ${res.xp ?? 0} XP.`,
         });
       }
 
@@ -745,7 +916,7 @@ export default function App({ currentUser, onLogout }) {
     }
   };
 
-  // Student Test Complete Handler (+10 XP)
+  // Student Test Complete Handler
   const handleStudentCompleteTest = async (testId) => {
     const activeUserId = currentUser.id;
     setCompletingTestId(testId);
@@ -755,7 +926,7 @@ export default function App({ currentUser, onLogout }) {
       const res = await completeCodingTest(testId, activeUserId);
       setTestActionMsg({
         type: "success",
-        text: `🎉 Congratulations! You completed the test and earned +10 XP. Check your updated rank on the Leaderboard!`,
+        text: `🎉 Test finalized! Evaluated Score: ${res.score ?? 0}/${res.max_score ?? 0} pts • Total XP: ${res.xp ?? 0} XP.`,
       });
       await loadCodingTests();
       await loadLeaderboardData();
@@ -1115,19 +1286,36 @@ export default function App({ currentUser, onLogout }) {
                       </span>
                       <select
                         value={selectedLanguage}
-                        onChange={(e) => setSelectedLanguage(e.target.value)}
+                        onChange={(e) => handleLanguageChange(e.target.value)}
                         className="form-select"
                         style={{ padding: "4px 8px", fontSize: 12 }}
                       >
                         <option value="python">Python 3</option>
+                        <option value="c">C (GCC)</option>
                         <option value="cpp">C++ (GCC)</option>
                         <option value="java">Java 17</option>
                         <option value="javascript">JavaScript (Node)</option>
                       </select>
                     </div>
 
-                    <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
-                      Target: Practice Session
+                    <div style={{ fontSize: 12, color: "var(--text-muted)", display: "flex", alignItems: "center", gap: 8 }}>
+                      {activeAssignmentId ? (
+                        <>
+                          <span className="badge badge-easy" style={{ fontSize: 11 }}>
+                            Assignment #{activeAssignmentId}
+                          </span>
+                          <button
+                            type="button"
+                            className="btn btn-outline"
+                            style={{ padding: "2px 6px", fontSize: 10 }}
+                            onClick={() => setActiveAssignmentId(null)}
+                          >
+                            Switch to Practice
+                          </button>
+                        </>
+                      ) : (
+                        "Target: Practice Session"
+                      )}
                     </div>
                   </div>
 
@@ -1138,49 +1326,171 @@ export default function App({ currentUser, onLogout }) {
                     spellCheck="false"
                   />
 
+                  {/* SAMPLE EXECUTION OUTPUT CONSOLE */}
+                  {sampleRunResult && (
+                    <div
+                      style={{
+                        padding: "12px 16px",
+                        backgroundColor: sampleRunResult.status === "Accepted" ? "#f0fdf4" : "#fef2f2",
+                        borderTop: `1px solid ${sampleRunResult.status === "Accepted" ? "#86efac" : "#fecaca"}`,
+                        fontSize: 12,
+                        maxHeight: 220,
+                        overflowY: "auto",
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          <strong>Sample Run Verdict:</strong>
+                          <StatusBadge status={sampleRunResult.status} />
+                          <span style={{ color: "var(--text-muted)" }}>
+                            ({sampleRunResult.passed_count || 0}/{sampleRunResult.total_count || 0} public samples passed
+                            {sampleRunResult.execution_time != null ? ` • ${sampleRunResult.execution_time} ms` : ""})
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          className="btn btn-outline"
+                          style={{ padding: "1px 6px", fontSize: 10 }}
+                          onClick={() => setSampleRunResult(null)}
+                        >
+                          Clear
+                        </button>
+                      </div>
+
+                      {sampleRunResult.error_message && (
+                        <pre
+                          style={{
+                            backgroundColor: "#1e293b",
+                            color: "#f87171",
+                            padding: 8,
+                            borderRadius: 6,
+                            fontSize: 11,
+                            whiteSpace: "pre-wrap",
+                            margin: "6px 0",
+                          }}
+                        >
+                          {sampleRunResult.error_message}
+                        </pre>
+                      )}
+
+                      {sampleRunResult.results?.length > 0 && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 6 }}>
+                          {sampleRunResult.results.map((r, idx) => (
+                            <div
+                              key={r.test_case_id || idx}
+                              style={{
+                                backgroundColor: "white",
+                                border: "1px solid var(--border-light)",
+                                borderRadius: 6,
+                                padding: 8,
+                              }}
+                            >
+                              <div style={{ display: "flex", justifyContent: "space-between", fontWeight: 600, marginBottom: 4 }}>
+                                <span>Sample #{idx + 1}</span>
+                                <span style={{ color: r.passed ? "#15803d" : "#b91c1c" }}>
+                                  {r.status} ({r.execution_time || 0} ms)
+                                </span>
+                              </div>
+                              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, fontFamily: "monospace", fontSize: 11 }}>
+                                <div>
+                                  <div style={{ color: "var(--text-muted)", fontWeight: 600 }}>Input:</div>
+                                  <pre style={{ margin: 0, whiteSpace: "pre-wrap" }}>{r.input || "(empty)"}</pre>
+                                </div>
+                                <div>
+                                  <div style={{ color: "var(--text-muted)", fontWeight: 600 }}>Expected:</div>
+                                  <pre style={{ margin: 0, whiteSpace: "pre-wrap" }}>{r.expected_output}</pre>
+                                </div>
+                                <div>
+                                  <div style={{ color: "var(--text-muted)", fontWeight: 600 }}>Actual:</div>
+                                  <pre style={{ margin: 0, whiteSpace: "pre-wrap" }}>{r.actual_output ?? "(none)"}</pre>
+                                </div>
+                              </div>
+                              {r.error_message && (
+                                <div style={{ color: "#b91c1c", fontSize: 11, marginTop: 4, fontFamily: "monospace" }}>
+                                  {r.error_message}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* SUBMISSION EVALUATION VERDICT PANEL */}
                   {lastSubmissionResult && (
                     <div
                       style={{
                         padding: "12px 16px",
-                        backgroundColor: "#fef3c7",
-                        borderTop: "1px solid #fde68a",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        fontSize: 13,
-                        color: "#92400e",
+                        backgroundColor:
+                          lastSubmissionResult.status === "Accepted"
+                            ? "#ecfdf5"
+                            : lastSubmissionResult.status === "Pending Evaluation" || lastSubmissionResult.status === "Running"
+                            ? "#fef3c7"
+                            : "#fef2f2",
+                        borderTop: "1px solid var(--border-light)",
+                        fontSize: 12,
+                        maxHeight: 240,
+                        overflowY: "auto",
                       }}
                     >
-                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <AlertCircle size={18} />
-                        <div>
-                          <strong>Submission Saved (#{lastSubmissionResult.id}):</strong> Status is{" "}
-                          <span style={{ fontWeight: 700 }}>{lastSubmissionResult.status}</span>.
-                          <div style={{ fontSize: 11, color: "#b45309" }}>
-                            Stored securely in MySQL database. (Isolated sandbox execution engine can be attached in Phase 7)
-                          </div>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          <strong>Submission #{lastSubmissionResult.id}:</strong>
+                          <StatusBadge status={lastSubmissionResult.status} />
+                          <span style={{ fontWeight: 700 }}>
+                            Score: {lastSubmissionResult.score ?? 0}/{lastSubmissionResult.max_score ?? 10} pts
+                          </span>
+                          <span style={{ color: "var(--text-muted)" }}>
+                            ({lastSubmissionResult.passed_count ?? 0}/{lastSubmissionResult.total_count ?? 0} test cases passed
+                            {lastSubmissionResult.execution_time != null ? ` • ${lastSubmissionResult.execution_time} ms` : ""})
+                          </span>
                         </div>
+                        {lastSubmissionResult.hidden_summary && lastSubmissionResult.hidden_summary.total > 0 && (
+                          <span className="badge badge-medium" style={{ fontSize: 11 }}>
+                            Hidden Tests: {lastSubmissionResult.hidden_summary.passed}/{lastSubmissionResult.hidden_summary.total} Passed
+                          </span>
+                        )}
                       </div>
+
+                      {(lastSubmissionResult.status === "Pending Evaluation" || lastSubmissionResult.status === "Running") && (
+                        <div style={{ fontSize: 11, color: "#92400e", marginTop: 4 }}>
+                          ⏳ Isolated grader worker is evaluating your submission against public and hidden test cases...
+                        </div>
+                      )}
+
+                      {lastSubmissionResult.error_message && (
+                        <pre
+                          style={{
+                            backgroundColor: "#1e293b",
+                            color: "#f87171",
+                            padding: 8,
+                            borderRadius: 6,
+                            fontSize: 11,
+                            whiteSpace: "pre-wrap",
+                            marginTop: 6,
+                          }}
+                        >
+                          {lastSubmissionResult.error_message}
+                        </pre>
+                      )}
                     </div>
                   )}
 
                   <div className="editor-footer">
                     <button
                       className="btn btn-outline"
-                      onClick={() =>
-                        alert(
-                          "Direct client-side execution is securely restricted. Use Submit to record your solution to the database."
-                        )
-                      }
-                      title="Run code against sample test cases"
+                      onClick={handleRunPracticeSamples}
+                      disabled={isRunningSamples || isSubmitting || !selectedProblem}
+                      title="Execute code against public sample test cases in isolated sandbox"
                     >
-                      <Play size={16} /> Run Samples
+                      <Play size={16} /> {isRunningSamples ? "Running Samples..." : "Run Samples"}
                     </button>
 
                     <button
                       className="btn btn-primary"
                       onClick={handleSubmitSolution}
-                      disabled={isSubmitting || !selectedProblem}
+                      disabled={isSubmitting || isRunningSamples || !selectedProblem}
                     >
                       <Send size={16} /> {isSubmitting ? "Submitting..." : "Submit Solution"}
                     </button>
@@ -1266,9 +1576,16 @@ export default function App({ currentUser, onLogout }) {
                               style={{ padding: "4px 10px", fontSize: 12 }}
                               onClick={() => {
                                 if (asgn.problems.length > 0) {
+                                  setActiveAssignmentId(asgn.id);
                                   setActiveTab("practice");
-                                  const targetProb = problems.find((p) => p.id === asgn.problems[0].problem_id);
-                                  if (targetProb) openProblem(targetProb);
+                                  const targetProb =
+                                    problems.find((p) => p.id === asgn.problems[0].problem_id) || {
+                                      id: asgn.problems[0].problem_id,
+                                      title: asgn.problems[0].title,
+                                      difficulty: asgn.problems[0].difficulty,
+                                      topic: asgn.problems[0].topic,
+                                    };
+                                  openProblem(targetProb);
                                 }
                               }}
                             >
@@ -1384,7 +1701,7 @@ export default function App({ currentUser, onLogout }) {
                         onClick={() => {
                           if (
                             window.confirm(
-                              "Are you sure you want to finish and submit this test? You will earn +10 XP upon submission."
+                              "Are you sure you want to finish and submit this test? Your score and XP will be calculated from your evaluated solutions."
                             )
                           ) {
                             handleFinalSubmitTest(false);
@@ -1465,7 +1782,11 @@ export default function App({ currentUser, onLogout }) {
                   {(() => {
                     const currentProb = activeTestSession.test.problems[activeTestSession.activeProblemIndex];
                     if (!currentProb) return null;
-                    const fullProblemDetail = problems.find((p) => p.id === currentProb.problem_id) || currentProb;
+                    const fullProblemDetail =
+                      activeTestSession.problemDetails?.[currentProb.problem_id] ||
+                      problems.find((p) => p.id === currentProb.problem_id) ||
+                      currentProb;
+                    const firstSample = fullProblemDetail.test_cases?.[0];
 
                     return (
                       <div className="practice-layout">
@@ -1548,9 +1869,10 @@ export default function App({ currentUser, onLogout }) {
                                   borderRadius: 6,
                                   fontFamily: "monospace",
                                   fontSize: 12,
+                                  whiteSpace: "pre-wrap",
                                 }}
                               >
-                                {fullProblemDetail.sample_input || "5 10"}
+                                {firstSample?.input || fullProblemDetail.sample_input || "(empty)"}
                               </div>
                             </div>
                             <div>
@@ -1564,9 +1886,10 @@ export default function App({ currentUser, onLogout }) {
                                   borderRadius: 6,
                                   fontFamily: "monospace",
                                   fontSize: 12,
+                                  whiteSpace: "pre-wrap",
                                 }}
                               >
-                                {fullProblemDetail.sample_output || "15"}
+                                {firstSample?.expected_output || fullProblemDetail.sample_output || "(empty)"}
                               </div>
                             </div>
                           </div>
@@ -1586,6 +1909,7 @@ export default function App({ currentUser, onLogout }) {
                                 style={{ padding: "4px 8px", fontSize: 12 }}
                               >
                                 <option value="python">Python 3</option>
+                                <option value="c">C (GCC)</option>
                                 <option value="cpp">C++ (GCC)</option>
                                 <option value="java">Java 17</option>
                                 <option value="javascript">JavaScript (Node)</option>
@@ -1632,18 +1956,20 @@ export default function App({ currentUser, onLogout }) {
                                 backgroundColor: testRunOutput.passed ? "#f0fdf4" : "#fefce8",
                                 borderTop: `1px solid ${testRunOutput.passed ? "#86efac" : "#fde047"}`,
                                 fontSize: 12,
+                                maxHeight: 190,
+                                overflowY: "auto",
                               }}
                             >
                               <div style={{ display: "flex", alignItems: "center", gap: 6, fontWeight: 700, color: testRunOutput.passed ? "#15803d" : "#a16207" }}>
                                 <CheckCircle2 size={16} /> {testRunOutput.status}: {testRunOutput.message}
                               </div>
-                              {testRunOutput.userOutput && (
+                              {testRunOutput.userOutput !== undefined && testRunOutput.expectedOutput !== undefined && (
                                 <div style={{ marginTop: 6, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-                                  <div style={{ backgroundColor: "white", padding: 6, borderRadius: 4, border: "1px solid #e2e8f0" }}>
+                                  <div style={{ backgroundColor: "white", padding: 6, borderRadius: 4, border: "1px solid #e2e8f0", fontFamily: "monospace" }}>
                                     <strong>Expected:</strong> {testRunOutput.expectedOutput}
                                   </div>
-                                  <div style={{ backgroundColor: "white", padding: 6, borderRadius: 4, border: "1px solid #e2e8f0" }}>
-                                    <strong>Output:</strong> {testRunOutput.userOutput}
+                                  <div style={{ backgroundColor: "white", padding: 6, borderRadius: 4, border: "1px solid #e2e8f0", fontFamily: "monospace" }}>
+                                    <strong>Actual Output:</strong> {testRunOutput.userOutput || "(empty)"}
                                   </div>
                                 </div>
                               )}
@@ -1653,7 +1979,7 @@ export default function App({ currentUser, onLogout }) {
                           <div className="editor-footer" style={{ display: "flex", justifyContent: "space-between" }}>
                             <button
                               className="btn btn-outline"
-                              onClick={() => handleRunTestSampleCode(fullProblemDetail)}
+                              onClick={() => handleRunTestSampleCode(currentProb)}
                               disabled={isTestEvaluating}
                               style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
                             >
@@ -1667,7 +1993,7 @@ export default function App({ currentUser, onLogout }) {
                                 onClick={() => handleSaveAndSubmitTestProblem(currentProb)}
                                 disabled={isTestEvaluating}
                               >
-                                <Save size={15} /> Save & Submit Question
+                                <Save size={15} /> {isTestEvaluating ? "Grading..." : "Save & Evaluate Question"}
                               </button>
                             </div>
                           </div>
@@ -2064,72 +2390,243 @@ export default function App({ currentUser, onLogout }) {
           )}
 
           {/* ========================================================= */}
-          {/* 6. SUBMISSIONS HISTORY */}
+          {/* 6. SUBMISSIONS HISTORY & CODE / EVALUATION REVIEW */}
           {/* ========================================================= */}
           {activeTab === "submissions" && (
-            <div className="card">
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
-                <div>
-                  <h3 style={{ fontSize: 18, fontWeight: 700 }}>
-                    {isTeacher ? `Class Submissions (${submissions.length})` : `My Submissions (${submissions.length})`}
-                  </h3>
-                  <p style={{ color: "var(--text-muted)", fontSize: 13 }}>
-                    {isTeacher
-                      ? "Every code submission made by students across practice, assignments and tests."
-                      : "All of the solutions you've submitted."}
-                  </p>
-                </div>
-                <button className="btn btn-outline" onClick={loadSubmissions}>
-                  Refresh History
-                </button>
-              </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+              {selectedSubmissionDetail && (
+                <div className="card" style={{ border: "2px solid var(--primary)", backgroundColor: "#f8fafc" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 12 }}>
+                    <div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                        <h3 style={{ fontSize: 17, fontWeight: 800, margin: 0 }}>
+                          Submission #{selectedSubmissionDetail.id} — {selectedSubmissionDetail.problem_title}
+                        </h3>
+                        <StatusBadge status={selectedSubmissionDetail.status} />
+                        <span style={{ fontSize: 13, fontWeight: 700, color: "var(--primary)" }}>
+                          Score: {selectedSubmissionDetail.score ?? 0}/{selectedSubmissionDetail.max_score ?? 10} pts
+                        </span>
+                        <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                          • {selectedSubmissionDetail.passed_count ?? 0}/{selectedSubmissionDetail.total_count ?? 0} test cases passed
+                        </span>
+                        {selectedSubmissionDetail.execution_time != null && (
+                          <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                            • {selectedSubmissionDetail.execution_time} ms
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 4 }}>
+                        {isTeacher && (
+                          <>
+                            <strong>Student:</strong> {userName(selectedSubmissionDetail.user_id)} •{" "}
+                          </>
+                        )}
+                        <strong>Language:</strong> {selectedSubmissionDetail.language} •{" "}
+                        <strong>Context:</strong> {selectedSubmissionDetail.submission_type} •{" "}
+                        <strong>Submitted:</strong> {new Date(selectedSubmissionDetail.submitted_at).toLocaleString()}
+                        {selectedSubmissionDetail.hidden_summary && (
+                          <>
+                            {" "}
+                            • <strong>Hidden Tests:</strong> {selectedSubmissionDetail.hidden_summary.passed}/
+                            {selectedSubmissionDetail.hidden_summary.total} passed
+                          </>
+                        )}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className="btn btn-outline"
+                      onClick={() => setSelectedSubmissionDetail(null)}
+                    >
+                      Close Review
+                    </button>
+                  </div>
 
-              {submissions.length === 0 ? (
-                <div style={{ textAlign: "center", padding: "40px 0", color: "var(--text-muted)" }}>
-                  No submissions recorded in the database yet.
-                </div>
-              ) : (
-                <div className="table-container">
-                  <table className="clan-table">
-                    <thead>
-                      <tr>
-                        <th>Sub ID</th>
-                        {isTeacher && <th>Student</th>}
-                        <th>Problem Title</th>
-                        <th>Language</th>
-                        <th>Evaluation Status</th>
-                        <th>Context</th>
-                        <th>Timestamp</th>
-                        <th>Score</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {submissions.map((sub) => (
-                        <tr key={sub.id}>
-                          <td>#{sub.id}</td>
-                          {isTeacher && <td style={{ fontWeight: 600 }}>{userName(sub.user_id)}</td>}
-                          <td style={{ fontWeight: 600 }}>{sub.problem_title}</td>
-                          <td style={{ textTransform: "capitalize" }}>{sub.language}</td>
-                          <td>
-                            <span
-                              className={`badge ${
-                                sub.status === "Accepted"
-                                  ? "badge-status-accepted"
-                                  : "badge-status-pending"
-                              }`}
-                            >
-                              {sub.status}
-                            </span>
-                          </td>
-                          <td style={{ textTransform: "capitalize" }}>{sub.submission_type}</td>
-                          <td>{new Date(sub.submitted_at).toLocaleString()}</td>
-                          <td>{sub.score || 0.0} pts</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                  {selectedSubmissionDetail.error_message && (
+                    <div style={{ marginBottom: 12 }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: "#991b1b", marginBottom: 4 }}>
+                        Compiler / Runtime / Sandbox Error Output:
+                      </div>
+                      <pre
+                        style={{
+                          backgroundColor: "#1e293b",
+                          color: "#f87171",
+                          padding: 10,
+                          borderRadius: 8,
+                          fontSize: 12,
+                          whiteSpace: "pre-wrap",
+                          margin: 0,
+                        }}
+                      >
+                        {selectedSubmissionDetail.error_message}
+                      </pre>
+                    </div>
+                  )}
+
+                  <div style={{ marginBottom: 12 }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-main)", marginBottom: 4 }}>
+                      Submitted Source Code ({selectedSubmissionDetail.language}):
+                    </div>
+                    <pre
+                      style={{
+                        backgroundColor: "#0f172a",
+                        color: "#e2e8f0",
+                        padding: 12,
+                        borderRadius: 8,
+                        fontSize: 12,
+                        fontFamily: "var(--font-mono)",
+                        whiteSpace: "pre-wrap",
+                        maxHeight: 260,
+                        overflowY: "auto",
+                        margin: 0,
+                      }}
+                    >
+                      {selectedSubmissionDetail.code}
+                    </pre>
+                  </div>
+
+                  {selectedSubmissionDetail.public_results?.length > 0 && (
+                    <div style={{ marginBottom: 12 }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-main)", marginBottom: 6 }}>
+                        Public Test Case Results ({selectedSubmissionDetail.public_results.length}):
+                      </div>
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 8 }}>
+                        {selectedSubmissionDetail.public_results.map((pr, idx) => (
+                          <div
+                            key={pr.test_case_id || idx}
+                            style={{
+                              backgroundColor: "white",
+                              border: "1px solid var(--border-light)",
+                              borderRadius: 6,
+                              padding: 8,
+                              fontSize: 11,
+                            }}
+                          >
+                            <div style={{ display: "flex", justifyContent: "space-between", fontWeight: 700, marginBottom: 4 }}>
+                              <span>Public Case #{idx + 1}</span>
+                              <StatusBadge status={pr.status} />
+                            </div>
+                            <div style={{ fontFamily: "monospace" }}>
+                              <div><strong>Input:</strong> {pr.input || "(empty)"}</div>
+                              <div><strong>Expected:</strong> {pr.expected_output}</div>
+                              <div><strong>Actual:</strong> {pr.actual_output ?? "(none)"}</div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {isTeacher && selectedSubmissionDetail.teacher_hidden_results?.length > 0 && (
+                    <div>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: "#1e40af", marginBottom: 6 }}>
+                        Teacher-Only Hidden Test Case Breakdown ({selectedSubmissionDetail.teacher_hidden_results.length}):
+                      </div>
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 8 }}>
+                        {selectedSubmissionDetail.teacher_hidden_results.map((hr, idx) => (
+                          <div
+                            key={hr.test_case_id || idx}
+                            style={{
+                              backgroundColor: "#eff6ff",
+                              border: "1px solid #bfdbfe",
+                              borderRadius: 6,
+                              padding: 8,
+                              fontSize: 11,
+                            }}
+                          >
+                            <div style={{ display: "flex", justifyContent: "space-between", fontWeight: 700, marginBottom: 4 }}>
+                              <span>Hidden Case #{idx + 1}</span>
+                              <StatusBadge status={hr.status} />
+                            </div>
+                            <div style={{ fontFamily: "monospace" }}>
+                              <div><strong>Actual Output:</strong> {hr.actual_output ?? "(none)"}</div>
+                              <div><strong>Runtime:</strong> {hr.execution_time ?? 0} ms</div>
+                              {hr.error_message && <div style={{ color: "#b91c1c" }}>{hr.error_message}</div>}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
+
+              <div className="card">
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+                  <div>
+                    <h3 style={{ fontSize: 18, fontWeight: 700 }}>
+                      {isTeacher ? `Class Submissions (${submissions.length})` : `My Submissions (${submissions.length})`}
+                    </h3>
+                    <p style={{ color: "var(--text-muted)", fontSize: 13 }}>
+                      {isTeacher
+                        ? "Every code submission made by students across practice, assignments and tests. Click Review to inspect code and testcase verdicts."
+                        : "All of the solutions you've submitted and their automated grading verdicts."}
+                    </p>
+                  </div>
+                  <button className="btn btn-outline" onClick={loadSubmissions}>
+                    Refresh History
+                  </button>
+                </div>
+
+                {submissions.length === 0 ? (
+                  <div style={{ textAlign: "center", padding: "40px 0", color: "var(--text-muted)" }}>
+                    No submissions recorded in the database yet.
+                  </div>
+                ) : (
+                  <div className="table-container">
+                    <table className="clan-table">
+                      <thead>
+                        <tr>
+                          <th>Sub ID</th>
+                          {isTeacher && <th>Student</th>}
+                          <th>Problem Title</th>
+                          <th>Language</th>
+                          <th>Verdict</th>
+                          <th>Test Cases</th>
+                          <th>Score</th>
+                          <th>Exec Time</th>
+                          <th>Context</th>
+                          <th>Timestamp</th>
+                          <th>Action</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {submissions.map((sub) => (
+                          <tr key={sub.id}>
+                            <td>#{sub.id}</td>
+                            {isTeacher && <td style={{ fontWeight: 600 }}>{userName(sub.user_id)}</td>}
+                            <td style={{ fontWeight: 600 }}>{sub.problem_title}</td>
+                            <td style={{ textTransform: "capitalize" }}>{sub.language}</td>
+                            <td>
+                              <StatusBadge status={sub.status} />
+                            </td>
+                            <td>
+                              {sub.passed_count ?? 0}/{sub.total_count ?? 0}
+                            </td>
+                            <td style={{ fontWeight: 600 }}>
+                              {sub.score ?? 0}/{sub.max_score ?? 10} pts
+                            </td>
+                            <td>{sub.execution_time != null ? `${sub.execution_time} ms` : "—"}</td>
+                            <td style={{ textTransform: "capitalize" }}>{sub.submission_type}</td>
+                            <td>{new Date(sub.submitted_at).toLocaleString()}</td>
+                            <td>
+                              <button
+                                type="button"
+                                className="btn btn-outline"
+                                style={{ padding: "3px 8px", fontSize: 11 }}
+                                onClick={() => handleInspectSubmission(sub.id)}
+                                disabled={isLoadingSubmissionDetail}
+                              >
+                                Review / Code
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
             </div>
           )}
 
@@ -2293,7 +2790,7 @@ export default function App({ currentUser, onLogout }) {
 
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
                       <div className="form-group">
-                        <label className="form-label">Sample Test Input *</label>
+                        <label className="form-label">Public Sample Test Input *</label>
                         <input
                           type="text"
                           className="form-input"
@@ -2305,7 +2802,7 @@ export default function App({ currentUser, onLogout }) {
                       </div>
 
                       <div className="form-group">
-                        <label className="form-label">Sample Test Expected Output *</label>
+                        <label className="form-label">Public Sample Test Expected Output *</label>
                         <input
                           type="text"
                           className="form-input"
@@ -2313,6 +2810,30 @@ export default function App({ currentUser, onLogout }) {
                           required
                           value={newProblem.sample_output}
                           onChange={(e) => setNewProblem({ ...newProblem, sample_output: e.target.value })}
+                        />
+                      </div>
+                    </div>
+
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+                      <div className="form-group">
+                        <label className="form-label">Hidden Grading Test Input (Optional)</label>
+                        <input
+                          type="text"
+                          className="form-input"
+                          placeholder="e.g. 100 250 (never shown to students)"
+                          value={newProblem.hidden_input || ""}
+                          onChange={(e) => setNewProblem({ ...newProblem, hidden_input: e.target.value })}
+                        />
+                      </div>
+
+                      <div className="form-group">
+                        <label className="form-label">Hidden Grading Expected Output (Optional)</label>
+                        <input
+                          type="text"
+                          className="form-input"
+                          placeholder="e.g. 350"
+                          value={newProblem.hidden_output || ""}
+                          onChange={(e) => setNewProblem({ ...newProblem, hidden_output: e.target.value })}
                         />
                       </div>
                     </div>

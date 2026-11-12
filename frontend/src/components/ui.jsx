@@ -49,11 +49,10 @@ export function SectionCard({ title, action, children }) {
 }
 
 export function StatusBadge({ status }) {
-  return (
-    <span className={`badge ${status === "Accepted" ? "badge-status-accepted" : "badge-status-pending"}`}>
-      {status}
-    </span>
-  );
+  const isAccepted = status === "Accepted";
+  const isPending = status === "Pending Evaluation" || status === "Running";
+  const cls = isAccepted ? "badge-status-accepted" : isPending ? "badge-status-pending" : "badge-hard";
+  return <span className={`badge ${cls}`}>{status}</span>;
 }
 
 export function EmptyState({ children }) {

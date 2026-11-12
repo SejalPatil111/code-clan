@@ -1,0 +1,17 @@
+# Dependencies are installed inside the image (Linux binaries)
+node_modules/
+dist/
+dist-ssr/
+
+# Never bake local env files into the image
+.env
+.env.*
+*.local
+
+# Misc
+*.log
+.git/
+.vscode/
+.idea/
+Dockerfile
+.dockerignore

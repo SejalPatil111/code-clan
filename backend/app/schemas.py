@@ -107,42 +107,104 @@ class ProblemResponse(ProblemBase):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     test_cases: Optional[List[TestCasePublic]] = []
+    hidden_test_count: int = 0
 
     class Config:
         from_attributes = True
 
 
 # =========================================================
-# SUBMISSION SCHEMAS
+# SUBMISSION & EXECUTION SCHEMAS
 # =========================================================
 
-class SubmissionCreate(BaseModel):
-    user_id: int
+class RunSamplesRequest(BaseModel):
     problem_id: int
-    code: str = Field(..., min_length=1)
-    language: str = Field(..., max_length=30)
+    language: str = Field(..., min_length=1, max_length=30)
+    code: str = Field(..., min_length=1, max_length=65536)
+
+
+class SampleTestCaseResult(BaseModel):
+    test_case_number: int
+    test_case_id: int
+    input: str
+    expected_output: str
+    actual_output: str
+    passed: bool
+    status: str
+    execution_time: Optional[float] = None
+    error_message: Optional[str] = None
+
+
+class RunSamplesResponse(BaseModel):
+    problem_id: int
+    language: str
+    status: str
+    overall_status: str
+    passed_count: int
+    total_count: int
+    execution_time: Optional[float] = None
+    error_message: Optional[str] = None
+    compile_error: Optional[str] = None
+    results: List[SampleTestCaseResult] = []
+
+
+class SubmissionCreate(BaseModel):
+    # Optional for backwards compatibility; derived from authenticated user token on backend.
+    user_id: Optional[int] = None
+    problem_id: int
+    code: str = Field(..., min_length=1, max_length=65536)
+    language: str = Field(..., min_length=1, max_length=30)
     submission_type: str = Field("practice", pattern="^(practice|assignment|coding_test|competition)$")
     assignment_id: Optional[int] = None
     coding_test_id: Optional[int] = None
     competition_id: Optional[int] = None
 
 
+class PublicSubmissionCaseResult(BaseModel):
+    test_case_number: int
+    test_case_id: int
+    is_hidden: bool = False
+    input: Optional[str] = None
+    expected_output: Optional[str] = None
+    actual_output: Optional[str] = None
+    passed: bool
+    status: str
+    execution_time: Optional[float] = None
+    error_message: Optional[str] = None
+
+
+class HiddenTestsSummary(BaseModel):
+    total: int = 0
+    passed: int = 0
+    failed: int = 0
+
+
 class SubmissionResponse(BaseModel):
     id: int
     user_id: int
+    user_name: Optional[str] = None
     problem_id: int
     code: str
     language: str
     status: str
     score: Optional[float] = 0.0
+    max_score: float = 10.0
+    passed_count: int = 0
+    total_count: int = 0
     execution_time: Optional[float] = None
     memory_used: Optional[float] = None
+    error_message: Optional[str] = None
     submitted_at: Optional[datetime] = None
+    evaluated_at: Optional[datetime] = None
+    attempt_count: int = 0
     submission_type: str
     assignment_id: Optional[int] = None
     coding_test_id: Optional[int] = None
     competition_id: Optional[int] = None
     problem_title: Optional[str] = None
+    public_results: Optional[List[PublicSubmissionCaseResult]] = None
+    hidden_summary: Optional[HiddenTestsSummary] = None
+    teacher_hidden_results: Optional[List[PublicSubmissionCaseResult]] = None
 
     class Config:
         from_attributes = True
@@ -213,17 +275,19 @@ class NewCustomProblemInput(BaseModel):
     examples: Optional[str] = None
     sample_input: Optional[str] = None
     sample_output: Optional[str] = None
+    hidden_input: Optional[str] = None
+    hidden_output: Optional[str] = None
 
 
 class CodingTestCreate(BaseModel):
     title: str = Field(..., min_length=3, max_length=200)
     description: Optional[str] = None
     created_by: Optional[int] = None  # overridden by the authenticated teacher
-    duration: int = Field(60, ge=5, le=360) # duration in minutes
+    duration: int = Field(60, ge=5, le=360)  # duration in minutes
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
-    problem_ids: List[int] = [] # existing question bank problem IDs
-    custom_problems: Optional[List[NewCustomProblemInput]] = [] # uniquely created test questions
+    problem_ids: List[int] = []  # existing question bank problem IDs
+    custom_problems: Optional[List[NewCustomProblemInput]] = []  # uniquely created test questions
 
 
 class CodingTestResponse(BaseModel):
@@ -240,6 +304,7 @@ class CodingTestResponse(BaseModel):
     enrolled_count: int = 0
     completed_count: int = 0
     my_status: Optional[str] = None  # populated when requested for a specific student
+    my_score: Optional[float] = None
 
     class Config:
         from_attributes = True
@@ -256,11 +321,11 @@ class LeaderboardEntry(BaseModel):
     email: str
     role: str
     tests_completed: int
+    problems_solved: int = 0
     xp: int
 
     class Config:
         from_attributes = True
-
 
 
 # =========================================================
@@ -274,6 +339,7 @@ class StudentProgress(BaseModel):
     joined_at: Optional[datetime] = None
     xp: int = 0
     tests_completed: int = 0
+    problems_solved: int = 0
     total_submissions: int = 0
     accepted_submissions: int = 0
     problems_attempted: int = 0
@@ -304,6 +370,7 @@ class StudentOverview(BaseModel):
     total_ranked: int
     tests_completed: int
     tests_available: int
+    problems_solved: int = 0
     total_submissions: int
     accepted_submissions: int
     problems_attempted: int

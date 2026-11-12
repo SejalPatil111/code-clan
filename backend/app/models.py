@@ -203,6 +203,10 @@ class Submission(Base):
 
     score = Column(Float, default=0)
 
+    passed_count = Column(Integer, nullable=False, default=0)
+
+    total_count = Column(Integer, nullable=False, default=0)
+
     execution_time = Column(
         Float,
         nullable=True
@@ -213,9 +217,30 @@ class Submission(Base):
         nullable=True
     )
 
+    error_message = Column(
+        Text,
+        nullable=True
+    )
+
     submitted_at = Column(
         DateTime,
         server_default=func.now()
+    )
+
+    started_at = Column(
+        DateTime,
+        nullable=True
+    )
+
+    evaluated_at = Column(
+        DateTime,
+        nullable=True
+    )
+
+    attempt_count = Column(
+        Integer,
+        nullable=False,
+        default=0
     )
 
     # Submission context

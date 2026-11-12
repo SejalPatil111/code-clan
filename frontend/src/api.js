@@ -1,4 +1,6 @@
-const API_BASE = "/api";
+// Defaults to "/api", which the Vite dev server proxies to FastAPI (see vite.config.js).
+// VITE_* variables are embedded in browser code: never put secrets in them.
+const API_BASE = import.meta.env.VITE_API_BASE_URL || "/api";
 const TOKEN_KEY = "codeclan_token";
 const USER_KEY = "codeclan_user";
 
@@ -108,6 +110,28 @@ export function createProblem(problemData) {
   return request("/problems", { method: "POST", body: problemData, errorMessage: "Failed to create problem" });
 }
 
+export function addProblemTestCase(problemId, testCaseData) {
+  return request(`/problems/${problemId}/test-cases`, {
+    method: "POST",
+    body: testCaseData,
+    errorMessage: "Failed to add test case",
+  });
+}
+
+export function fetchProblemTestCases(problemId) {
+  return request(`/problems/${problemId}/test-cases`, {
+    errorMessage: "Failed to fetch problem test cases",
+  });
+}
+
+export function runSampleCases({ problem_id, language, code }) {
+  return request("/submissions/run-samples", {
+    method: "POST",
+    body: { problem_id, language, code },
+    errorMessage: "Sample execution failed",
+  });
+}
+
 export function fetchSubmissions(filters = {}) {
   return request(
     withQuery("/submissions", {
@@ -117,6 +141,12 @@ export function fetchSubmissions(filters = {}) {
     }),
     { errorMessage: "Failed to fetch submissions" }
   );
+}
+
+export function fetchSubmissionById(submissionId) {
+  return request(`/submissions/${submissionId}`, {
+    errorMessage: "Failed to fetch submission details",
+  });
 }
 
 export function createSubmission(submissionData) {
@@ -152,8 +182,8 @@ export function createCodingTest(testData) {
   return request("/coding-tests", { method: "POST", body: testData, errorMessage: "Failed to create coding test" });
 }
 
-export function completeCodingTest(testId, studentId) {
-  return request(`/coding-tests/${testId}/complete?student_id=${studentId}`, {
+export function completeCodingTest(testId) {
+  return request(`/coding-tests/${testId}/complete`, {
     method: "POST",
     errorMessage: "Failed to record test completion",
   });
