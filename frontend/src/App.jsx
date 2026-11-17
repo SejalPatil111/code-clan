@@ -51,6 +51,7 @@ import {
   completeCodingTest,
   fetchLeaderboard,
   fetchExecutionSecurityStatus,
+  fetchEnvironments,
 } from "./api";
 import TeacherDashboard from "./components/TeacherDashboard";
 import StudentDashboard from "./components/StudentDashboard";
@@ -143,7 +144,11 @@ export default function App({ currentUser, onLogout }) {
   const [editorCode, setEditorCode] = useState(
     "# Write your Python solution here\ndef solve():\n    pass\n"
   );
+  const [projectFiles, setProjectFiles] = useState({ "main.py": "# Write your Python solution here\ndef solve():\n    pass\n" });
+  const [activeFileName, setActiveFileName] = useState("main.py");
+  const [newFileNameInput, setNewFileNameInput] = useState("");
   const [selectedLanguage, setSelectedLanguage] = useState("python");
+  const [environmentsCatalog, setEnvironmentsCatalog] = useState([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isRunningSamples, setIsRunningSamples] = useState(false);
   const [sampleRunResult, setSampleRunResult] = useState(null);
@@ -179,6 +184,18 @@ export default function App({ currentUser, onLogout }) {
     output_format: "",
     constraints: "",
     examples: "",
+    environment_id: "cp",
+    problem_type: "competitive",
+    evaluation_type: "exact",
+    tolerance: "0.00001",
+    ml_metric: "f1",
+    ml_threshold: "0.80",
+    target_file: "output.csv",
+    function_name: "solve",
+    custom_evaluator_script: "",
+    dataset_filename: "",
+    dataset_visibility: "public",
+    dataset_content: "",
     sample_input: "",
     sample_output: "",
     hidden_input: "",
@@ -243,6 +260,9 @@ export default function App({ currentUser, onLogout }) {
     loadLeaderboardData();
     fetchExecutionSecurityStatus()
       .then((st) => setSecurityStatus(st))
+      .catch(() => {});
+    fetchEnvironments()
+      .then((res) => setEnvironmentsCatalog(res.environments || []))
       .catch(() => {});
   }, []);
 
@@ -322,14 +342,41 @@ export default function App({ currentUser, onLogout }) {
     }
   };
 
+  const getDefaultFileNameForLang = (lang) => {
+    if (lang === "c") return "main.c";
+    if (lang === "cpp") return "main.cpp";
+    if (lang === "java") return "Main.java";
+    if (lang === "javascript") return "main.js";
+    return "main.py";
+  };
+
   const openProblem = async (prob, langOverride = null) => {
-    const lang = langOverride || selectedLanguage;
     try {
       const fullProb = await fetchProblemById(prob.id);
+      const envId = fullProb.environment_id || "cp";
+      const lang = envId !== "cp" ? "python" : (langOverride || selectedLanguage);
+      if (envId !== "cp" && selectedLanguage !== "python") {
+        setSelectedLanguage("python");
+      }
       setSelectedProblem(fullProb);
       setLastSubmissionResult(null);
       setSampleRunResult(null);
-      setEditorCode(getLanguageTemplate(lang, fullProb.title, fullProb.difficulty, fullProb.topic));
+
+      if (fullProb.starter_files && typeof fullProb.starter_files === "object" && Object.keys(fullProb.starter_files).length > 0) {
+        const filesObj = { ...fullProb.starter_files };
+        const firstKey = fullProb.entry_point && filesObj[fullProb.entry_point]
+          ? fullProb.entry_point
+          : Object.keys(filesObj)[0];
+        setProjectFiles(filesObj);
+        setActiveFileName(firstKey);
+        setEditorCode(filesObj[firstKey] || "");
+      } else {
+        const fname = getDefaultFileNameForLang(lang);
+        const tpl = getLanguageTemplate(lang, fullProb.title, fullProb.difficulty, fullProb.topic);
+        setProjectFiles({ [fname]: tpl });
+        setActiveFileName(fname);
+        setEditorCode(tpl);
+      }
     } catch (err) {
       console.error("Error fetching problem details:", err);
       setSelectedProblem(prob);
@@ -340,8 +387,56 @@ export default function App({ currentUser, onLogout }) {
     setSelectedLanguage(newLang);
     setSampleRunResult(null);
     if (selectedProblem) {
-      setEditorCode(getLanguageTemplate(newLang, selectedProblem.title, selectedProblem.difficulty, selectedProblem.topic));
+      const fname = getDefaultFileNameForLang(newLang);
+      const tpl = getLanguageTemplate(newLang, selectedProblem.title, selectedProblem.difficulty, selectedProblem.topic);
+      setProjectFiles({ [fname]: tpl });
+      setActiveFileName(fname);
+      setEditorCode(tpl);
     }
+  };
+
+  const handleEditorCodeChange = (newCode) => {
+    setEditorCode(newCode);
+    setProjectFiles((prev) => ({
+      ...prev,
+      [activeFileName]: newCode,
+    }));
+  };
+
+  const handleSelectProjectFile = (fname) => {
+    setActiveFileName(fname);
+    setEditorCode(projectFiles[fname] ?? "");
+  };
+
+  const handleAddProjectFile = () => {
+    const clean = (newFileNameInput || "").trim().replace(/^\/+/, "");
+    if (!clean) return;
+    if (projectFiles[clean] !== undefined) {
+      handleSelectProjectFile(clean);
+      setNewFileNameInput("");
+      return;
+    }
+    const stub = clean.endsWith(".py")
+      ? `# ${clean}\n`
+      : clean.endsWith(".h") || clean.endsWith(".hpp")
+      ? `#pragma once\n`
+      : `// ${clean}\n`;
+    setProjectFiles((prev) => ({ ...prev, [clean]: stub }));
+    setActiveFileName(clean);
+    setEditorCode(stub);
+    setNewFileNameInput("");
+  };
+
+  const handleDeleteProjectFile = (fname) => {
+    const keys = Object.keys(projectFiles);
+    if (keys.length <= 1) return;
+    const next = { ...projectFiles };
+    delete next[fname];
+    const remainingKeys = Object.keys(next);
+    const nextActive = remainingKeys[0];
+    setProjectFiles(next);
+    setActiveFileName(nextActive);
+    setEditorCode(next[nextActive] || "");
   };
 
   const handleFilterChange = (diff) => {
@@ -359,11 +454,15 @@ export default function App({ currentUser, onLogout }) {
     if (!selectedProblem) return;
     setIsRunningSamples(true);
     setSampleRunResult(null);
+    const currentFiles = { ...projectFiles, [activeFileName]: editorCode };
+    const isMultiFile = Object.keys(currentFiles).length > 1;
     try {
       const res = await runSampleCases({
         problem_id: selectedProblem.id,
         language: selectedLanguage,
         code: editorCode,
+        files: isMultiFile ? currentFiles : undefined,
+        entry_point: selectedProblem.entry_point || undefined,
       });
       setSampleRunResult(res);
     } catch (err) {
@@ -384,12 +483,16 @@ export default function App({ currentUser, onLogout }) {
     if (!selectedProblem) return;
     setIsSubmitting(true);
     setLastSubmissionResult(null);
+    const currentFiles = { ...projectFiles, [activeFileName]: editorCode };
+    const isMultiFile = Object.keys(currentFiles).length > 1;
 
     try {
       const payload = {
         user_id: activeUserId,
         problem_id: selectedProblem.id,
         code: editorCode,
+        files: isMultiFile ? currentFiles : undefined,
+        entry_point: selectedProblem.entry_point || undefined,
         language: selectedLanguage,
         submission_type: activeAssignmentId ? "assignment" : "practice",
         assignment_id: activeAssignmentId || undefined,
@@ -480,8 +583,8 @@ export default function App({ currentUser, onLogout }) {
     try {
       const testCases = [
         {
-          input: newProblem.sample_input || "sample_input",
-          expected_output: newProblem.sample_output || "sample_output",
+          input: newProblem.sample_input || "",
+          expected_output: newProblem.sample_output || "",
           is_hidden: false,
         },
       ];
@@ -490,6 +593,34 @@ export default function App({ currentUser, onLogout }) {
           input: newProblem.hidden_input || "",
           expected_output: newProblem.hidden_output || "",
           is_hidden: true,
+        });
+      }
+
+      const evalConfig = {};
+      if (newProblem.evaluation_type === "numeric_tolerance") {
+        evalConfig.abs_tol = parseFloat(newProblem.tolerance) || 1e-5;
+      } else if (newProblem.evaluation_type === "ml_metrics") {
+        evalConfig.metric = newProblem.ml_metric || "f1";
+        evalConfig.threshold = parseFloat(newProblem.ml_threshold) || 0.8;
+      } else if (newProblem.evaluation_type === "file_based") {
+        evalConfig.target_file = newProblem.target_file || "output.csv";
+      } else if (newProblem.evaluation_type === "function_harness") {
+        evalConfig.function_name = newProblem.function_name || "solve";
+      } else if (newProblem.evaluation_type === "custom_script") {
+        evalConfig.custom_evaluator_script = newProblem.custom_evaluator_script || "";
+      }
+
+      const datasets = [];
+      if (newProblem.dataset_filename?.trim() && newProblem.dataset_content?.trim()) {
+        datasets.push({
+          filename: newProblem.dataset_filename.trim(),
+          visibility: newProblem.dataset_visibility || "public",
+          mime_type: newProblem.dataset_filename.endsWith(".csv")
+            ? "text/csv"
+            : newProblem.dataset_filename.endsWith(".json")
+            ? "application/json"
+            : "text/plain",
+          content_text: newProblem.dataset_content,
         });
       }
 
@@ -502,12 +633,20 @@ export default function App({ currentUser, onLogout }) {
         output_format: newProblem.output_format?.trim() || null,
         constraints: newProblem.constraints?.trim() || null,
         examples: newProblem.examples?.trim() || null,
+        environment_id: newProblem.environment_id || "cp",
+        problem_type: newProblem.problem_type || "competitive",
+        evaluation_type: newProblem.evaluation_type || "exact",
+        evaluation_config: Object.keys(evalConfig).length > 0 ? evalConfig : null,
         created_by: activeUserId,
         test_cases: testCases,
+        datasets: datasets.length > 0 ? datasets : undefined,
       };
 
       const res = await createProblem(payload);
-      setFormMsg({ type: "success", text: `Problem "${res.title}" created successfully and added to database!` });
+      setFormMsg({
+        type: "success",
+        text: `Problem "${res.title}" (Environment: ${res.environment_id}, Grading: ${res.evaluation_type}) created and published!`,
+      });
       setNewProblem({
         title: "",
         difficulty: "Easy",
@@ -517,6 +656,18 @@ export default function App({ currentUser, onLogout }) {
         output_format: "",
         constraints: "",
         examples: "",
+        environment_id: "cp",
+        problem_type: "competitive",
+        evaluation_type: "exact",
+        tolerance: "0.00001",
+        ml_metric: "f1",
+        ml_threshold: "0.80",
+        target_file: "output.csv",
+        function_name: "solve",
+        custom_evaluator_script: "",
+        dataset_filename: "",
+        dataset_visibility: "public",
+        dataset_content: "",
         sample_input: "",
         sample_output: "",
         hidden_input: "",
@@ -1159,7 +1310,7 @@ export default function App({ currentUser, onLogout }) {
                   {selectedProblem ? (
                     <>
                       <div>
-                        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
                           <h2 style={{ fontSize: 22, fontWeight: 700, margin: 0 }}>
                             {selectedProblem.title}
                           </h2>
@@ -1177,7 +1328,41 @@ export default function App({ currentUser, onLogout }) {
                           >
                             {selectedProblem.topic}
                           </span>
+                          <span
+                            style={{
+                              fontSize: 11,
+                              fontWeight: 600,
+                              backgroundColor: "#eff6ff",
+                              color: "#1d4ed8",
+                              border: "1px solid #bfdbfe",
+                              padding: "2px 8px",
+                              borderRadius: 6,
+                            }}
+                          >
+                            Env: {selectedProblem.environment_info?.name || selectedProblem.environment_id || "cp"}
+                          </span>
+                          {selectedProblem.evaluation_type && selectedProblem.evaluation_type !== "exact" && (
+                            <span
+                              style={{
+                                fontSize: 11,
+                                fontWeight: 600,
+                                backgroundColor: "#f3e8ff",
+                                color: "#6b21a8",
+                                border: "1px solid #e9d5ff",
+                                padding: "2px 8px",
+                                borderRadius: 6,
+                              }}
+                            >
+                              Eval: {selectedProblem.evaluation_type}
+                            </span>
+                          )}
                         </div>
+                        {selectedProblem.environment_info?.libraries?.length > 0 && (
+                          <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 8 }}>
+                            <strong>Preinstalled Libraries:</strong>{" "}
+                            {selectedProblem.environment_info.libraries.join(" • ")}
+                          </div>
+                        )}
                       </div>
 
                       <div>
@@ -1233,6 +1418,57 @@ export default function App({ currentUser, onLogout }) {
                           >
                             {selectedProblem.constraints}
                           </pre>
+                        </div>
+                      )}
+
+                      {selectedProblem.datasets?.length > 0 && (
+                        <div>
+                          <h4 style={{ fontSize: 14, fontWeight: 600, color: "var(--text-main)", marginBottom: 6 }}>
+                            Mounted Read-Only Datasets (/work/data/)
+                          </h4>
+                          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                            {selectedProblem.datasets.map((ds) => (
+                              <div
+                                key={ds.id}
+                                style={{
+                                  border: "1px solid #bfdbfe",
+                                  borderRadius: 8,
+                                  padding: 10,
+                                  fontSize: 12,
+                                  backgroundColor: "#f8fafc",
+                                }}
+                              >
+                                <div style={{ display: "flex", justifyContent: "space-between", fontWeight: 600 }}>
+                                  <code>/work/data/{ds.filename}</code>
+                                  <span style={{ color: "var(--text-muted)", fontSize: 11 }}>
+                                    {ds.size_bytes} bytes • {ds.mime_type}
+                                  </span>
+                                </div>
+                                {ds.description && (
+                                  <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 2 }}>
+                                    {ds.description}
+                                  </div>
+                                )}
+                                {ds.preview_text && (
+                                  <pre
+                                    style={{
+                                      marginTop: 6,
+                                      marginBottom: 0,
+                                      padding: 6,
+                                      backgroundColor: "#f1f5f9",
+                                      borderRadius: 4,
+                                      fontSize: 11,
+                                      maxHeight: 90,
+                                      overflowY: "auto",
+                                      whiteSpace: "pre-wrap",
+                                    }}
+                                  >
+                                    {ds.preview_text}
+                                  </pre>
+                                )}
+                              </div>
+                            ))}
+                          </div>
                         </div>
                       )}
 
@@ -1342,10 +1578,82 @@ export default function App({ currentUser, onLogout }) {
                     </div>
                   </div>
 
+                  {/* MULTI-FILE PROJECT TAB BAR */}
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: 8,
+                      padding: "6px 12px",
+                      backgroundColor: "#f8fafc",
+                      borderBottom: "1px solid var(--border-light)",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                      {Object.keys(projectFiles).map((fname) => {
+                        const active = fname === activeFileName;
+                        return (
+                          <div
+                            key={fname}
+                            style={{
+                              display: "inline-flex",
+                              alignItems: "center",
+                              gap: 4,
+                              padding: "3px 8px",
+                              borderRadius: 6,
+                              fontSize: 12,
+                              fontWeight: active ? 700 : 500,
+                              backgroundColor: active ? "var(--primary)" : "white",
+                              color: active ? "white" : "var(--text-main)",
+                              border: `1px solid ${active ? "var(--primary)" : "var(--border-light)"}`,
+                              cursor: "pointer",
+                            }}
+                            onClick={() => handleSelectProjectFile(fname)}
+                          >
+                            <span>{fname}</span>
+                            {Object.keys(projectFiles).length > 1 && (
+                              <span
+                                title={`Remove ${fname}`}
+                                style={{ marginLeft: 4, opacity: 0.8, fontWeight: 700 }}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleDeleteProjectFile(fname);
+                                }}
+                              >
+                                ×
+                              </span>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                      <input
+                        type="text"
+                        placeholder="Add file (e.g. utils.py)"
+                        value={newFileNameInput}
+                        onChange={(e) => setNewFileNameInput(e.target.value)}
+                        className="form-input"
+                        style={{ padding: "2px 8px", fontSize: 11, width: 145 }}
+                      />
+                      <button
+                        type="button"
+                        className="btn btn-outline"
+                        style={{ padding: "2px 8px", fontSize: 11 }}
+                        onClick={handleAddProjectFile}
+                      >
+                        + Add File
+                      </button>
+                    </div>
+                  </div>
+
                   <textarea
                     className="code-textarea"
                     value={editorCode}
-                    onChange={(e) => setEditorCode(e.target.value)}
+                    onChange={(e) => handleEditorCodeChange(e.target.value)}
                     spellCheck="false"
                   />
 
@@ -1411,7 +1719,8 @@ export default function App({ currentUser, onLogout }) {
                               <div style={{ display: "flex", justifyContent: "space-between", fontWeight: 600, marginBottom: 4 }}>
                                 <span>Sample #{idx + 1}</span>
                                 <span style={{ color: r.passed ? "#15803d" : "#b91c1c" }}>
-                                  {r.status} ({r.execution_time || 0} ms)
+                                  {r.status} ({r.execution_time || 0} ms
+                                  {r.memory_used ? ` • ${Math.round(r.memory_used)} KB` : ""})
                                 </span>
                               </div>
                               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, fontFamily: "monospace", fontSize: 11 }}>
@@ -1428,6 +1737,53 @@ export default function App({ currentUser, onLogout }) {
                                   <pre style={{ margin: 0, whiteSpace: "pre-wrap" }}>{r.actual_output ?? "(none)"}</pre>
                                 </div>
                               </div>
+                              {r.feedback && (
+                                <div style={{ color: "#1e40af", fontSize: 11, marginTop: 4 }}>
+                                  <strong>Evaluator Feedback:</strong> {r.feedback}
+                                </div>
+                              )}
+                              {r.metrics && Object.keys(r.metrics).length > 0 && (
+                                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 4, fontSize: 11 }}>
+                                  {Object.entries(r.metrics).map(([mk, mv]) => (
+                                    <span
+                                      key={mk}
+                                      style={{
+                                        backgroundColor: "#eff6ff",
+                                        border: "1px solid #bfdbfe",
+                                        padding: "1px 6px",
+                                        borderRadius: 4,
+                                        color: "#1e3a8a",
+                                      }}
+                                    >
+                                      <strong>{mk}:</strong> {String(mv)}
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                              {r.output_files?.length > 0 && (
+                                <div style={{ marginTop: 6, fontSize: 11 }}>
+                                  <strong>Generated Files (/work/output/):</strong>{" "}
+                                  {r.output_files.map((of, fIdx) => (
+                                    <span key={fIdx} style={{ marginRight: 8 }}>
+                                      <code>{of.name}</code> ({of.size_bytes} B)
+                                      {of.name?.endsWith(".png") && of.content_b64 && (
+                                        <img
+                                          src={`data:image/png;base64,${of.content_b64}`}
+                                          alt={of.name}
+                                          style={{
+                                            display: "block",
+                                            maxWidth: 240,
+                                            maxHeight: 140,
+                                            marginTop: 4,
+                                            border: "1px solid var(--border-light)",
+                                            borderRadius: 4,
+                                          }}
+                                        />
+                                      )}
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
                               {r.error_message && (
                                 <div style={{ color: "#b91c1c", fontSize: 11, marginTop: 4, fontFamily: "monospace" }}>
                                   {r.error_message}
@@ -1466,9 +1822,29 @@ export default function App({ currentUser, onLogout }) {
                           </span>
                           <span style={{ color: "var(--text-muted)" }}>
                             ({lastSubmissionResult.passed_count ?? 0}/{lastSubmissionResult.total_count ?? 0} test cases passed
-                            {lastSubmissionResult.execution_time != null ? ` • ${lastSubmissionResult.execution_time} ms` : ""})
+                            {lastSubmissionResult.execution_time != null ? ` • ${lastSubmissionResult.execution_time} ms` : ""}
+                            {lastSubmissionResult.memory_used != null ? ` • ${Math.round(lastSubmissionResult.memory_used)} KB` : ""})
                           </span>
                         </div>
+                        {lastSubmissionResult.metrics && Object.keys(lastSubmissionResult.metrics).length > 0 && (
+                          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                            {Object.entries(lastSubmissionResult.metrics).map(([mk, mv]) => (
+                              <span
+                                key={mk}
+                                style={{
+                                  fontSize: 11,
+                                  backgroundColor: "#eff6ff",
+                                  border: "1px solid #bfdbfe",
+                                  padding: "1px 6px",
+                                  borderRadius: 4,
+                                  color: "#1e3a8a",
+                                }}
+                              >
+                                <strong>{mk}:</strong> {String(mv)}
+                              </span>
+                            ))}
+                          </div>
+                        )}
                         {lastSubmissionResult.hidden_summary && lastSubmissionResult.hidden_summary.total > 0 && (
                           <span className="badge badge-medium" style={{ fontSize: 11 }}>
                             Hidden Tests: {lastSubmissionResult.hidden_summary.passed}/{lastSubmissionResult.hidden_summary.total} Passed
@@ -2785,6 +3161,193 @@ export default function App({ currentUser, onLogout }) {
                         value={newProblem.description}
                         onChange={(e) => setNewProblem({ ...newProblem, description: e.target.value })}
                       />
+                    </div>
+
+                    {/* UNIVERSAL EXECUTION ENVIRONMENT & EVALUATION STRATEGY */}
+                    <div
+                      style={{
+                        backgroundColor: "#f8fafc",
+                        border: "1px solid var(--border-light)",
+                        borderRadius: 8,
+                        padding: 14,
+                        marginBottom: 16,
+                      }}
+                    >
+                      <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 10, color: "var(--text-main)" }}>
+                        Execution Environment & Automated Grading Strategy
+                      </div>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 14 }}>
+                        <div className="form-group" style={{ marginBottom: 0 }}>
+                          <label className="form-label">Execution Environment *</label>
+                          <select
+                            className="form-select"
+                            value={newProblem.environment_id}
+                            onChange={(e) => setNewProblem({ ...newProblem, environment_id: e.target.value })}
+                          >
+                            <option value="cp">Env A: Competitive Programming (Python/C/C++/Java/JS)</option>
+                            <option value="datascience">Env B: Data Science (NumPy, Pandas, SciPy, Matplotlib)</option>
+                            <option value="ml">Env C: Machine Learning (Scikit-learn, Pandas, NumPy)</option>
+                            <option value="cv">Env D: Computer Vision (OpenCV, Pillow, Scikit-image)</option>
+                            <option value="nlp">Env E: NLP (NLTK, spaCy, Scikit-learn)</option>
+                            <option value="dl-torch">Env F1: Deep Learning (PyTorch CPU)</option>
+                            <option value="dl-tf">Env F2: Deep Learning (TensorFlow CPU)</option>
+                            <option value="scientific">Env G: Scientific Computing (SymPy, SciPy, NetworkX)</option>
+                          </select>
+                        </div>
+
+                        <div className="form-group" style={{ marginBottom: 0 }}>
+                          <label className="form-label">Assignment Category</label>
+                          <select
+                            className="form-select"
+                            value={newProblem.problem_type}
+                            onChange={(e) => setNewProblem({ ...newProblem, problem_type: e.target.value })}
+                          >
+                            <option value="competitive">Competitive / Algorithmic</option>
+                            <option value="multifile">Multi-File Software Engineering</option>
+                            <option value="data_science">Data Science & Analytics</option>
+                            <option value="machine_learning">Machine Learning Model</option>
+                            <option value="computer_vision">Computer Vision / Image Processing</option>
+                            <option value="nlp">Natural Language Processing</option>
+                            <option value="deep_learning">Deep Learning (Neural Networks)</option>
+                            <option value="scientific">Scientific / Numerical Methods</option>
+                          </select>
+                        </div>
+
+                        <div className="form-group" style={{ marginBottom: 0 }}>
+                          <label className="form-label">Evaluation Strategy *</label>
+                          <select
+                            className="form-select"
+                            value={newProblem.evaluation_type}
+                            onChange={(e) => setNewProblem({ ...newProblem, evaluation_type: e.target.value })}
+                          >
+                            <option value="exact">Type A: Exact Output Matching</option>
+                            <option value="numeric_tolerance">Type B: Numeric Tolerance (Floating-Point)</option>
+                            <option value="structured_json">Type C: Structured JSON / Matrix</option>
+                            <option value="file_based">Type D: Generated File Inspection (/work/output/)</option>
+                            <option value="function_harness">Type E: Python Function Harness</option>
+                            <option value="ml_metrics">Type F: ML Evaluation Metrics (F1 / Accuracy / RMSE)</option>
+                            <option value="custom_script">Type G: Custom Teacher Evaluation Script</option>
+                          </select>
+                        </div>
+                      </div>
+
+                      {newProblem.evaluation_type === "numeric_tolerance" && (
+                        <div style={{ marginTop: 12 }}>
+                          <label className="form-label">Floating-Point Absolute Tolerance</label>
+                          <input
+                            type="text"
+                            className="form-input"
+                            style={{ maxWidth: 220 }}
+                            value={newProblem.tolerance}
+                            onChange={(e) => setNewProblem({ ...newProblem, tolerance: e.target.value })}
+                          />
+                        </div>
+                      )}
+
+                      {newProblem.evaluation_type === "ml_metrics" && (
+                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 12 }}>
+                          <div>
+                            <label className="form-label">ML Evaluation Metric</label>
+                            <select
+                              className="form-select"
+                              value={newProblem.ml_metric}
+                              onChange={(e) => setNewProblem({ ...newProblem, ml_metric: e.target.value })}
+                            >
+                              <option value="f1">Macro F1 Score (&gt;= threshold)</option>
+                              <option value="accuracy">Classification Accuracy (&gt;= threshold)</option>
+                              <option value="precision">Macro Precision (&gt;= threshold)</option>
+                              <option value="recall">Macro Recall (&gt;= threshold)</option>
+                              <option value="rmse">Regression RMSE (&lt;= threshold)</option>
+                              <option value="mae">Regression MAE (&lt;= threshold)</option>
+                            </select>
+                          </div>
+                          <div>
+                            <label className="form-label">Pass Threshold</label>
+                            <input
+                              type="text"
+                              className="form-input"
+                              value={newProblem.ml_threshold}
+                              onChange={(e) => setNewProblem({ ...newProblem, ml_threshold: e.target.value })}
+                            />
+                          </div>
+                        </div>
+                      )}
+
+                      {newProblem.evaluation_type === "file_based" && (
+                        <div style={{ marginTop: 12 }}>
+                          <label className="form-label">Target Output File in /work/output/</label>
+                          <input
+                            type="text"
+                            className="form-input"
+                            style={{ maxWidth: 280 }}
+                            placeholder="e.g. report.csv or plot.png"
+                            value={newProblem.target_file}
+                            onChange={(e) => setNewProblem({ ...newProblem, target_file: e.target.value })}
+                          />
+                        </div>
+                      )}
+
+                      {newProblem.evaluation_type === "function_harness" && (
+                        <div style={{ marginTop: 12 }}>
+                          <label className="form-label">Target Python Function Name</label>
+                          <input
+                            type="text"
+                            className="form-input"
+                            style={{ maxWidth: 280 }}
+                            placeholder="e.g. solve"
+                            value={newProblem.function_name}
+                            onChange={(e) => setNewProblem({ ...newProblem, function_name: e.target.value })}
+                          />
+                        </div>
+                      )}
+
+                      {newProblem.evaluation_type === "custom_script" && (
+                        <div style={{ marginTop: 12 }}>
+                          <label className="form-label">Custom Teacher Evaluator Script (Runs in separate isolated container)</label>
+                          <textarea
+                            rows={4}
+                            className="form-textarea"
+                            placeholder="import json, os&#10;print(json.dumps({'passed': True, 'score_fraction': 1.0, 'feedback': 'OK'}))"
+                            value={newProblem.custom_evaluator_script}
+                            onChange={(e) => setNewProblem({ ...newProblem, custom_evaluator_script: e.target.value })}
+                          />
+                        </div>
+                      )}
+
+                      {/* OPTIONAL DATASET ATTACHMENT */}
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 2fr", gap: 12, marginTop: 12 }}>
+                        <div>
+                          <label className="form-label">Dataset Filename (/work/data/)</label>
+                          <input
+                            type="text"
+                            className="form-input"
+                            placeholder="e.g. dataset.csv"
+                            value={newProblem.dataset_filename}
+                            onChange={(e) => setNewProblem({ ...newProblem, dataset_filename: e.target.value })}
+                          />
+                        </div>
+                        <div>
+                          <label className="form-label">Dataset Visibility</label>
+                          <select
+                            className="form-select"
+                            value={newProblem.dataset_visibility}
+                            onChange={(e) => setNewProblem({ ...newProblem, dataset_visibility: e.target.value })}
+                          >
+                            <option value="public">Public Sample Dataset</option>
+                            <option value="hidden">Hidden Grading Dataset</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label className="form-label">Dataset Content (CSV / JSON / TXT)</label>
+                          <textarea
+                            rows={2}
+                            className="form-textarea"
+                            placeholder="x,y&#10;1,2&#10;3,6"
+                            value={newProblem.dataset_content}
+                            onChange={(e) => setNewProblem({ ...newProblem, dataset_content: e.target.value })}
+                          />
+                        </div>
+                      </div>
                     </div>
 
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>

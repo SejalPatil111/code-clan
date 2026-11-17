@@ -1,12 +1,16 @@
+import base64
 from collections import defaultdict
 from datetime import datetime, timedelta
+import io
 import json
 import os
+import posixpath
 import threading
 import time
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import urllib.error
 import urllib.request
+import zipfile
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,14 +30,25 @@ from app.database import Base, engine, get_db, wait_for_db
 from app.grading.comparison import (
     STATUS_ACCEPTED,
     STATUS_PENDING,
+    STATUS_RUNNING,
     SUPPORTED_LANGUAGES,
     TERMINAL_STATUSES,
     normalize_language,
+)
+from app.grading.environments import (
+    effective_profile,
+    get_environment,
+    list_environments,
+)
+from app.grading.evaluators import (
+    SUPPORTED_EVALUATION_TYPES,
+    parse_evaluation_config,
 )
 from app.grading.worker import (
     evaluate_submission_by_id,
     execute_sample_cases,
     get_submission_max_score,
+    get_worker_telemetry,
     recompute_coding_test_student_score,
 )
 from app.models import (
@@ -44,6 +59,7 @@ from app.models import (
     CodingTestProblem,
     CodingTestStudent,
     Problem,
+    ProblemDataset,
     Submission,
     SubmissionResult,
     TestCase,
@@ -57,6 +73,8 @@ from app.schemas import (
     AuthResponse,
     CodingTestCreate,
     CodingTestResponse,
+    DatasetCreate,
+    DatasetPublicResponse,
     HiddenTestsSummary,
     LeaderboardEntry,
     LoginRequest,
@@ -96,6 +114,30 @@ def _run_lightweight_migrations():
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE users ADD COLUMN password_hash VARCHAR(255) NULL"))
 
+    if "problems" in table_names:
+        prob_cols = {c["name"] for c in inspector.get_columns("problems")}
+        prob_alters = []
+        if "environment_id" not in prob_cols:
+            prob_alters.append("ADD COLUMN environment_id VARCHAR(40) NOT NULL DEFAULT 'cp'")
+        if "problem_type" not in prob_cols:
+            prob_alters.append("ADD COLUMN problem_type VARCHAR(40) NOT NULL DEFAULT 'competitive'")
+        if "evaluation_type" not in prob_cols:
+            prob_alters.append("ADD COLUMN evaluation_type VARCHAR(40) NOT NULL DEFAULT 'exact'")
+        if "evaluation_config" not in prob_cols:
+            prob_alters.append("ADD COLUMN evaluation_config TEXT NULL")
+        if "resource_overrides" not in prob_cols:
+            prob_alters.append("ADD COLUMN resource_overrides TEXT NULL")
+        if "starter_files" not in prob_cols:
+            prob_alters.append("ADD COLUMN starter_files TEXT NULL")
+        if "entry_point" not in prob_cols:
+            prob_alters.append("ADD COLUMN entry_point VARCHAR(120) NULL")
+        if "max_score" not in prob_cols:
+            prob_alters.append("ADD COLUMN max_score FLOAT NOT NULL DEFAULT 10.0")
+        if prob_alters:
+            with engine.begin() as conn:
+                for stmt in prob_alters:
+                    conn.execute(text(f"ALTER TABLE problems {stmt}"))
+
     if "submissions" in table_names:
         sub_cols = {c["name"] for c in inspector.get_columns("submissions")}
         alter_stmts = []
@@ -111,6 +153,12 @@ def _run_lightweight_migrations():
             alter_stmts.append("ADD COLUMN evaluated_at DATETIME NULL")
         if "attempt_count" not in sub_cols:
             alter_stmts.append("ADD COLUMN attempt_count INT NOT NULL DEFAULT 0")
+        if "files_json" not in sub_cols:
+            alter_stmts.append("ADD COLUMN files_json TEXT NULL")
+        if "entry_point" not in sub_cols:
+            alter_stmts.append("ADD COLUMN entry_point VARCHAR(120) NULL")
+        if "metrics_json" not in sub_cols:
+            alter_stmts.append("ADD COLUMN metrics_json TEXT NULL")
         if alter_stmts:
             with engine.begin() as conn:
                 for stmt in alter_stmts:
@@ -233,6 +281,45 @@ def execution_security_status():
     }
 
 
+@app.get("/environments", tags=["General"])
+def get_execution_environments():
+    """Return preconfigured execution environments and supported evaluation strategies."""
+    return {
+        "environments": list_environments(),
+        "evaluation_types": list(SUPPORTED_EVALUATION_TYPES),
+        "supported_languages": list(SUPPORTED_LANGUAGES),
+    }
+
+
+@app.get("/execution/metrics", tags=["General"])
+def get_execution_metrics(db: Session = Depends(get_db)):
+    """Return queue depth, submission status counts, and grader worker telemetry."""
+    pending_count = db.query(Submission).filter(Submission.status == STATUS_PENDING).count()
+    running_count = db.query(Submission).filter(Submission.status == STATUS_RUNNING).count()
+    total_submissions = db.query(Submission).count()
+    accepted_submissions = db.query(Submission).filter(Submission.status == STATUS_ACCEPTED).count()
+
+    sec_status = execution_security_status()
+    return {
+        "queue": {
+            "pending": pending_count,
+            "running": running_count,
+            "total_submissions": total_submissions,
+            "accepted_submissions": accepted_submissions,
+        },
+        "worker_telemetry": sec_status.get("telemetry", get_worker_telemetry()),
+        "runtime_security": {
+            "active_runtime": sec_status.get("active_runtime"),
+            "security_mode": sec_status.get("security_mode"),
+            "gvisor_verified": sec_status.get("gvisor_verified", False),
+            "containers_verified": sec_status.get("containers_verified", 0),
+            "container_verification_failures": sec_status.get("container_verification_failures", 0),
+            "active_sandbox_containers": sec_status.get("active_sandbox_containers", []),
+        },
+        "environments": list_environments(),
+    }
+
+
 # =========================================================
 # AUTH ENDPOINTS
 # =========================================================
@@ -347,13 +434,57 @@ def get_user(
 
 
 # =========================================================
-# PROBLEM ENDPOINTS (WITH HIDDEN TEST CASE PROTECTION)
+# PROBLEM & DATASET ENDPOINTS (WITH HIDDEN TEST/DATASET PROTECTION)
 # =========================================================
+
+MAX_DATASET_FILE_BYTES = 2 * 1024 * 1024  # 2 MB per dataset file
+
+
+def _sanitize_dataset_filename(name: str) -> str:
+    clean = (name or "").replace("\\", "/").strip().lstrip("/")
+    norm = posixpath.normpath(clean)
+    if not norm or norm.startswith("..") or "/.." in norm or norm.startswith("/"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid dataset filename.")
+    return norm
+
+
+def _dataset_to_public_response(ds: ProblemDataset, include_content: bool = False) -> DatasetPublicResponse:
+    preview: Optional[str] = None
+    if ds.mime_type.startswith("text/") or ds.filename.endswith((".csv", ".json", ".txt", ".tsv", ".md")):
+        try:
+            raw = base64.b64decode(ds.content_b64 or "")
+            preview = raw[:1200].decode("utf-8", errors="replace")
+        except Exception:
+            preview = None
+    return DatasetPublicResponse(
+        id=ds.id,
+        problem_id=ds.problem_id,
+        filename=ds.filename,
+        visibility=ds.visibility,
+        mime_type=ds.mime_type,
+        size_bytes=ds.size_bytes,
+        description=ds.description,
+        preview_text=preview,
+        content_b64=ds.content_b64 if include_content else None,
+        created_at=ds.created_at,
+    )
+
+
+def _safe_json_loads(raw: Optional[str], default: Any = None) -> Any:
+    if not raw:
+        return default
+    try:
+        return json.loads(raw)
+    except Exception:
+        return default
+
 
 def _build_public_problem_response(p: Problem) -> ProblemResponse:
     """
-    Build a ProblemResponse containing ONLY public (`is_hidden == False`) test cases.
-    Hidden test case inputs and expected outputs are never included.
+    Build a ProblemResponse containing ONLY public (`is_hidden == False`) test cases
+    and public (`visibility == 'public'`) datasets.
+    Hidden test case inputs/outputs, hidden datasets, and custom teacher evaluator scripts
+    are never exposed to students.
     """
     public_tcs = [
         TestCasePublic(
@@ -367,6 +498,37 @@ def _build_public_problem_response(p: Problem) -> ProblemResponse:
         if not tc.is_hidden
     ]
     hidden_count = sum(1 for tc in p.test_cases if tc.is_hidden)
+
+    all_datasets = list(getattr(p, "datasets", []) or [])
+    public_ds = [
+        _dataset_to_public_response(ds, include_content=False)
+        for ds in all_datasets
+        if ds.visibility == "public"
+    ]
+    hidden_ds_count = sum(1 for ds in all_datasets if ds.visibility != "public")
+
+    env_id = getattr(p, "environment_id", None) or "cp"
+    try:
+        env_obj = get_environment(env_id)
+    except ValueError:
+        env_obj = get_environment("cp")
+
+    eval_cfg = _safe_json_loads(getattr(p, "evaluation_config", None), {})
+    if isinstance(eval_cfg, dict):
+        # Never expose custom teacher evaluator script source on public problem endpoint
+        public_eval_cfg = {
+            k: v
+            for k, v in eval_cfg.items()
+            if k not in {"custom_evaluator_script", "script"}
+        }
+        if "custom_evaluator_script" in eval_cfg or "script" in eval_cfg:
+            public_eval_cfg["has_custom_script"] = True
+    else:
+        public_eval_cfg = {}
+
+    res_ovr = _safe_json_loads(getattr(p, "resource_overrides", None), {})
+    starter = _safe_json_loads(getattr(p, "starter_files", None), None)
+
     return ProblemResponse(
         id=p.id,
         title=p.title,
@@ -377,12 +539,31 @@ def _build_public_problem_response(p: Problem) -> ProblemResponse:
         output_format=p.output_format,
         constraints=p.constraints,
         examples=p.examples,
+        environment_id=env_obj.id,
+        problem_type=getattr(p, "problem_type", None) or "competitive",
+        evaluation_type=getattr(p, "evaluation_type", None) or "exact",
+        evaluation_config=public_eval_cfg,
+        resource_overrides=effective_profile(env_obj, res_ovr if isinstance(res_ovr, dict) else None),
+        starter_files=starter,
+        entry_point=getattr(p, "entry_point", None),
+        max_score=float(getattr(p, "max_score", None) or 10.0),
         created_by=p.created_by,
         created_at=p.created_at,
         updated_at=p.updated_at,
         test_cases=public_tcs,
         hidden_test_count=hidden_count,
+        datasets=public_ds,
+        hidden_dataset_count=hidden_ds_count,
+        environment_info=env_obj.to_public_dict(),
     )
+
+
+def _serialize_json_field(val: Any) -> Optional[str]:
+    if val is None:
+        return None
+    if isinstance(val, str):
+        return val
+    return json.dumps(val)
 
 
 @app.post("/problems", response_model=ProblemResponse, status_code=status.HTTP_201_CREATED, tags=["Problems"])
@@ -393,6 +574,19 @@ def create_problem(
 ):
     problem.created_by = current_user.id
 
+    env_id = (problem.environment_id or "cp").strip()
+    try:
+        env_obj = get_environment(env_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    eval_type = (problem.evaluation_type or "exact").strip()
+    if eval_type not in SUPPORTED_EVALUATION_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported evaluation_type '{eval_type}'. Allowed: {', '.join(SUPPORTED_EVALUATION_TYPES)}.",
+        )
+
     new_problem = Problem(
         title=problem.title,
         description=problem.description,
@@ -402,6 +596,14 @@ def create_problem(
         output_format=problem.output_format,
         constraints=problem.constraints,
         examples=problem.examples,
+        environment_id=env_obj.id,
+        problem_type=problem.problem_type or "competitive",
+        evaluation_type=eval_type,
+        evaluation_config=_serialize_json_field(problem.evaluation_config),
+        resource_overrides=_serialize_json_field(problem.resource_overrides),
+        starter_files=_serialize_json_field(problem.starter_files),
+        entry_point=problem.entry_point,
+        max_score=float(problem.max_score or 10.0),
         created_by=current_user.id,
     )
     db.add(new_problem)
@@ -417,9 +619,116 @@ def create_problem(
             )
             db.add(new_tc)
 
+    if problem.datasets:
+        for ds in problem.datasets:
+            fname = _sanitize_dataset_filename(ds.filename)
+            if ds.content_b64:
+                try:
+                    raw_bytes = base64.b64decode(ds.content_b64)
+                except Exception:
+                    raise HTTPException(status_code=400, detail=f"Invalid base64 dataset '{fname}'.")
+                b64_str = ds.content_b64
+            else:
+                raw_bytes = (ds.content_text or "").encode("utf-8")
+                b64_str = base64.b64encode(raw_bytes).decode("ascii")
+            if len(raw_bytes) > MAX_DATASET_FILE_BYTES:
+                raise HTTPException(status_code=400, detail=f"Dataset '{fname}' exceeds 2 MB limit.")
+            db.add(
+                ProblemDataset(
+                    problem_id=new_problem.id,
+                    filename=fname,
+                    visibility=ds.visibility or "public",
+                    mime_type=ds.mime_type or "text/plain",
+                    size_bytes=len(raw_bytes),
+                    content_b64=b64_str,
+                    description=ds.description,
+                )
+            )
+
     db.commit()
     db.refresh(new_problem)
     return _build_public_problem_response(new_problem)
+
+
+@app.post("/problems/{problem_id}/datasets", response_model=DatasetPublicResponse, status_code=status.HTTP_201_CREATED, tags=["Problems"])
+def add_problem_dataset(
+    problem_id: int,
+    payload: DatasetCreate,
+    db: Session = Depends(get_db),
+    _teacher: User = Depends(require_teacher),
+):
+    problem = db.query(Problem).filter(Problem.id == problem_id).first()
+    if not problem:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Problem not found.")
+
+    fname = _sanitize_dataset_filename(payload.filename)
+    if payload.content_b64:
+        try:
+            raw_bytes = base64.b64decode(payload.content_b64)
+        except Exception:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid base64 dataset content.")
+        b64_str = payload.content_b64
+    else:
+        raw_bytes = (payload.content_text or "").encode("utf-8")
+        b64_str = base64.b64encode(raw_bytes).decode("ascii")
+
+    if len(raw_bytes) > MAX_DATASET_FILE_BYTES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Dataset exceeds 2 MB size limit.")
+
+    ds = ProblemDataset(
+        problem_id=problem.id,
+        filename=fname,
+        visibility=payload.visibility or "public",
+        mime_type=payload.mime_type or "text/plain",
+        size_bytes=len(raw_bytes),
+        content_b64=b64_str,
+        description=payload.description,
+    )
+    db.add(ds)
+    db.commit()
+    db.refresh(ds)
+    return _dataset_to_public_response(ds, include_content=True)
+
+
+@app.get("/problems/{problem_id}/datasets", response_model=List[DatasetPublicResponse], tags=["Problems"])
+def list_problem_datasets(
+    problem_id: int,
+    include_content: bool = Query(False),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    problem = db.query(Problem).filter(Problem.id == problem_id).first()
+    if not problem:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Problem not found.")
+
+    is_teacher = current_user.role in ("teacher", "admin")
+    rows = (
+        db.query(ProblemDataset)
+        .filter(ProblemDataset.problem_id == problem_id)
+        .order_by(ProblemDataset.id.asc())
+        .all()
+    )
+    visible = rows if is_teacher else [r for r in rows if r.visibility == "public"]
+    return [_dataset_to_public_response(r, include_content=include_content) for r in visible]
+
+
+@app.delete("/problems/{problem_id}/datasets/{dataset_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Problems"])
+def delete_problem_dataset(
+    problem_id: int,
+    dataset_id: int,
+    db: Session = Depends(get_db),
+    _teacher: User = Depends(require_teacher),
+):
+    ds = (
+        db.query(ProblemDataset)
+        .filter(ProblemDataset.id == dataset_id, ProblemDataset.problem_id == problem_id)
+        .first()
+    )
+    if not ds:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found.")
+    db.delete(ds)
+    db.commit()
+    return None
 
 
 @app.get("/problems", response_model=List[ProblemResponse], tags=["Problems"])
@@ -499,7 +808,7 @@ def _submission_to_response(
 ) -> SubmissionResponse:
     p_title = s.problem.title if s.problem else "Unknown Problem"
     u_name = s.user.name if s.user else f"User #{s.user_id}"
-    max_score = get_submission_max_score(s, db)
+    max_score = get_submission_max_score(s, db, problem=s.problem)
 
     total_count = s.total_count or (len(s.problem.test_cases) if s.problem and s.problem.test_cases else 0)
     passed_count = s.passed_count or 0
@@ -539,6 +848,7 @@ def _submission_to_response(
                             passed=passed,
                             status=r.status,
                             execution_time=r.execution_time,
+                            memory_used=r.memory_used,
                             error_message=r.error_message,
                         )
                     )
@@ -555,6 +865,7 @@ def _submission_to_response(
                         passed=passed,
                         status=r.status,
                         execution_time=r.execution_time,
+                        memory_used=r.memory_used,
                         error_message=r.error_message,
                     )
                 )
@@ -572,13 +883,22 @@ def _submission_to_response(
         if is_teacher:
             teacher_hidden_results = tch_hidden_list
 
+    files_dict = _safe_json_loads(getattr(s, "files_json", None), None)
+    metrics_dict = _safe_json_loads(getattr(s, "metrics_json", None), None)
+    env_id = (getattr(s.problem, "environment_id", None) if s.problem else None) or "cp"
+    eval_type = (getattr(s.problem, "evaluation_type", None) if s.problem else None) or "exact"
+
     return SubmissionResponse(
         id=s.id,
         user_id=s.user_id,
         user_name=u_name,
         problem_id=s.problem_id,
         code=s.code,
+        files=files_dict if isinstance(files_dict, dict) else None,
+        entry_point=getattr(s, "entry_point", None),
         language=s.language,
+        environment_id=env_id,
+        evaluation_type=eval_type,
         status=s.status,
         score=round(float(s.score or 0.0), 2),
         max_score=max_score,
@@ -587,6 +907,7 @@ def _submission_to_response(
         execution_time=s.execution_time,
         memory_used=s.memory_used,
         error_message=s.error_message,
+        metrics=metrics_dict if isinstance(metrics_dict, dict) else None,
         submitted_at=s.submitted_at,
         evaluated_at=s.evaluated_at,
         attempt_count=s.attempt_count or 0,
@@ -601,6 +922,37 @@ def _submission_to_response(
     )
 
 
+def _validate_and_normalize_files(
+    code: str,
+    files: Optional[Dict[str, str]],
+) -> tuple[str, Optional[Dict[str, str]]]:
+    """Validate single-file code or multi-file dict; return (primary_code, sanitized_files_dict)."""
+    if files:
+        if len(files) > 25:
+            raise HTTPException(status_code=400, detail="Maximum 25 source files allowed per submission.")
+        sanitized: Dict[str, str] = {}
+        total_bytes = 0
+        for raw_name, content in files.items():
+            clean = (raw_name or "").replace("\\", "/").strip().lstrip("/")
+            norm = posixpath.normpath(clean)
+            if not norm or norm.startswith("..") or "/.." in norm or norm.startswith("/"):
+                raise HTTPException(status_code=400, detail=f"Invalid file path '{raw_name}'.")
+            if not isinstance(content, str):
+                raise HTTPException(status_code=400, detail=f"Invalid file content for '{norm}'.")
+            total_bytes += len(content.encode("utf-8"))
+            if total_bytes > 512 * 1024:
+                raise HTTPException(status_code=400, detail="Total multi-file source size exceeds 512 KB.")
+            sanitized[norm] = content
+        if not sanitized:
+            raise HTTPException(status_code=400, detail="Submission must include at least one non-empty file.")
+        primary_code = code.strip() if code and code.strip() else next(iter(sanitized.values()))
+        return primary_code, sanitized
+
+    if not code or not code.strip():
+        raise HTTPException(status_code=422, detail="Source code cannot be empty.")
+    return code, None
+
+
 @app.post("/submissions/run-samples", response_model=RunSamplesResponse, tags=["Submissions"])
 def run_problem_samples(
     payload: RunSamplesRequest,
@@ -608,9 +960,9 @@ def run_problem_samples(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Execute student code against ONLY the public sample test cases of a problem.
-    Never loads or executes hidden test cases, never creates a graded submission,
-    and never awards XP.
+    Execute student code against ONLY the public sample test cases and public datasets
+    of a problem. Never loads or executes hidden test cases or hidden datasets,
+    never creates a graded submission, and never awards XP.
     """
     _check_sample_rate_limit(current_user.id)
 
@@ -620,6 +972,8 @@ def run_problem_samples(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unsupported language '{payload.language}'. Supported: {', '.join(SUPPORTED_LANGUAGES)}.",
         )
+
+    primary_code, files_dict = _validate_and_normalize_files(payload.code, payload.files)
 
     problem = db.query(Problem).filter(Problem.id == payload.problem_id).first()
     if not problem:
@@ -637,10 +991,27 @@ def run_problem_samples(
             detail="No public sample test cases are configured for this problem.",
         )
 
+    public_ds = (
+        db.query(ProblemDataset)
+        .filter(ProblemDataset.problem_id == problem.id, ProblemDataset.visibility == "public")
+        .order_by(ProblemDataset.id.asc())
+        .all()
+    )
+    public_ds_dicts = [
+        {"filename": ds.filename, "content_b64": ds.content_b64}
+        for ds in public_ds
+    ]
+
     tc_dicts = [
         {"id": tc.id, "input": tc.input, "expected_output": tc.expected_output}
         for tc in public_tcs
     ]
+
+    env_id = getattr(problem, "environment_id", None) or "cp"
+    eval_type = getattr(problem, "evaluation_type", None) or "exact"
+    eval_cfg = _safe_json_loads(getattr(problem, "evaluation_config", None), {})
+    res_ovr = _safe_json_loads(getattr(problem, "resource_overrides", None), {})
+    entry_pt = payload.entry_point or getattr(problem, "entry_point", None)
 
     # Delegate execution to the isolated grader worker over internal network when configured
     if GRADER_URL:
@@ -649,7 +1020,14 @@ def run_problem_samples(
                 {
                     "problem_id": problem.id,
                     "language": norm_lang,
-                    "code": payload.code,
+                    "code": primary_code,
+                    "files": files_dict,
+                    "entry_point": entry_pt,
+                    "environment_id": env_id,
+                    "evaluation_type": eval_type,
+                    "evaluation_config": eval_cfg,
+                    "resource_overrides": res_ovr,
+                    "public_datasets": public_ds_dicts,
                     "public_test_cases": tc_dicts,
                 }
             ).encode("utf-8")
@@ -662,7 +1040,7 @@ def run_problem_samples(
                 },
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=65) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 return RunSamplesResponse(**data)
         except urllib.error.URLError as exc:
@@ -675,8 +1053,15 @@ def run_problem_samples(
     data = execute_sample_cases(
         problem_id=problem.id,
         language=norm_lang,
-        code=payload.code,
+        code=primary_code,
         public_test_cases=tc_dicts,
+        files=files_dict,
+        entry_point=entry_pt,
+        environment_id=env_id,
+        evaluation_type=eval_type,
+        evaluation_config=eval_cfg,
+        resource_overrides=res_ovr,
+        public_datasets=public_ds_dicts,
     )
     return RunSamplesResponse(**data)
 
@@ -704,6 +1089,8 @@ def create_submission(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unsupported language '{sub.language}'. Supported: {', '.join(SUPPORTED_LANGUAGES)}.",
         )
+
+    primary_code, files_dict = _validate_and_normalize_files(sub.code, sub.files)
 
     user = db.query(User).filter(User.id == target_user_id).first()
     if not user:
@@ -751,7 +1138,9 @@ def create_submission(
     new_sub = Submission(
         user_id=target_user_id,
         problem_id=sub.problem_id,
-        code=sub.code,
+        code=primary_code,
+        files_json=json.dumps(files_dict) if files_dict else None,
+        entry_point=sub.entry_point or getattr(problem, "entry_point", None),
         language=norm_lang,
         status=STATUS_PENDING,
         score=0.0,

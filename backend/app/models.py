@@ -83,6 +83,16 @@ class Problem(Base):
     constraints = Column(Text, nullable=True)
     examples = Column(Text, nullable=True)
 
+    # Universal Execution Engine & Advanced Assignment metadata
+    environment_id = Column(String(40), nullable=False, default="cp")
+    problem_type = Column(String(40), nullable=False, default="competitive")
+    evaluation_type = Column(String(40), nullable=False, default="exact")
+    evaluation_config = Column(Text, nullable=True)
+    resource_overrides = Column(Text, nullable=True)
+    starter_files = Column(Text, nullable=True)
+    entry_point = Column(String(120), nullable=True)
+    max_score = Column(Float, nullable=False, default=10.0)
+
     created_by = Column(
         Integer,
         ForeignKey("users.id"),
@@ -108,6 +118,12 @@ class Problem(Base):
 
     test_cases = relationship(
         "TestCase",
+        back_populates="problem",
+        cascade="all, delete-orphan"
+    )
+
+    datasets = relationship(
+        "ProblemDataset",
         back_populates="problem",
         cascade="all, delete-orphan"
     )
@@ -267,6 +283,11 @@ class Submission(Base):
         ForeignKey("competitions.id"),
         nullable=True
     )
+
+    # Multi-file submission & evaluation metrics
+    files_json = Column(Text, nullable=True)
+    entry_point = Column(String(120), nullable=True)
+    metrics_json = Column(Text, nullable=True)
 
     # Relationships
     user = relationship(
@@ -821,4 +842,34 @@ class CompetitionParticipant(Base):
     student = relationship(
         "User",
         back_populates="competitions"
+    )
+
+
+# =========================================================
+# PROBLEM DATASETS (Public sample & Hidden evaluation files)
+# =========================================================
+
+class ProblemDataset(Base):
+    __tablename__ = "problem_datasets"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    problem_id = Column(
+        Integer,
+        ForeignKey("problems.id"),
+        nullable=False,
+        index=True
+    )
+
+    filename = Column(String(160), nullable=False)
+    visibility = Column(String(20), nullable=False, default="public")  # "public" or "hidden"
+    mime_type = Column(String(80), nullable=False, default="text/plain")
+    size_bytes = Column(Integer, nullable=False, default=0)
+    content_b64 = Column(Text(length=16777215), nullable=False)  # MEDIUMTEXT on MySQL
+    description = Column(String(255), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+    problem = relationship(
+        "Problem",
+        back_populates="datasets"
     )

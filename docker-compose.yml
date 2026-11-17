@@ -54,19 +54,46 @@ services:
     networks:
       - backend_net
 
+  # Body-validating Docker API policy proxy: inspects every POST /containers/create
+  # JSON body and container lifecycle call so the grader cannot create privileged
+  # containers, mount host paths, override runtimes, or touch non-sandbox containers.
+  docker-socket-proxy:
+    build:
+      context: ./backend/policy_proxy
+    image: codeclan-policy-proxy:latest
+    restart: unless-stopped
+    group_add:
+      - "0"
+    environment:
+      DOCKER_SOCK_PATH: /var/run/docker.sock
+      PROXY_LISTEN_HOST: "0.0.0.0"
+      PROXY_LISTEN_PORT: "2375"
+      PROXY_ALLOWED_RUNTIMES: ${PROXY_ALLOWED_RUNTIMES:-runsc,runc}
+      PROXY_ALLOWED_IMAGES: "codeclan-sandbox:latest,codeclan-env-*"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - docker_proxy_net
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
   grader:
     build:
       context: ./backend
       dockerfile: Dockerfile.grader
     restart: unless-stopped
-    group_add:
-      - "0"
     environment:
       DATABASE_URL: mysql+pymysql://${MYSQL_USER:-codeclan_user}:${MYSQL_PASSWORD}@${DB_HOST:-mysql}:${DB_PORT:-3306}/${MYSQL_DATABASE:-codeclan}?charset=utf8mb4
       SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env (see .env.example)}
       SQL_ECHO: "false"
       DB_CONNECT_RETRIES: ${DB_CONNECT_RETRIES:-10}
       DB_CONNECT_DELAY_SECONDS: ${DB_CONNECT_DELAY_SECONDS:-3}
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
       EXECUTION_ENV: ${EXECUTION_ENV:-development}
       SANDBOX_RUNTIME: ${SANDBOX_RUNTIME:-runsc}
       SANDBOX_REQUIRE_GVISOR: ${SANDBOX_REQUIRE_GVISOR:-false}
@@ -83,16 +110,16 @@ services:
       GRADER_INTERNAL_PORT: "8090"
     volumes:
       - ./backend:/app
-      # Only the isolated grader worker mounts the Docker socket to spawn ephemeral
-      # sandbox containers. FastAPI and student containers never receive this socket.
-      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - backend_net
+      - docker_proxy_net
     depends_on:
       mysql:
         condition: service_healthy
       sandbox:
         condition: service_completed_successfully
+      docker-socket-proxy:
+        condition: service_started
     deploy:
       resources:
         limits:
@@ -160,6 +187,9 @@ networks:
     driver: bridge
   backend_net:
     driver: bridge
+  docker_proxy_net:
+    driver: bridge
+    internal: true
 
 volumes:
   mysql_data:

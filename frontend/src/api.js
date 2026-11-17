@@ -124,10 +124,37 @@ export function fetchProblemTestCases(problemId) {
   });
 }
 
-export function runSampleCases({ problem_id, language, code }) {
+export function fetchEnvironments() {
+  return request("/environments", {
+    errorMessage: "Failed to fetch execution environments",
+  });
+}
+
+export function fetchProblemDatasets(problemId, includeContent = false) {
+  return request(withQuery(`/problems/${problemId}/datasets`, { include_content: includeContent }), {
+    errorMessage: "Failed to fetch problem datasets",
+  });
+}
+
+export function addProblemDataset(problemId, datasetData) {
+  return request(`/problems/${problemId}/datasets`, {
+    method: "POST",
+    body: datasetData,
+    errorMessage: "Failed to upload dataset",
+  });
+}
+
+export function deleteProblemDataset(problemId, datasetId) {
+  return request(`/problems/${problemId}/datasets/${datasetId}`, {
+    method: "DELETE",
+    errorMessage: "Failed to delete dataset",
+  });
+}
+
+export function runSampleCases({ problem_id, language, code, files, entry_point }) {
   return request("/submissions/run-samples", {
     method: "POST",
-    body: { problem_id, language, code },
+    body: { problem_id, language, code, files, entry_point },
     errorMessage: "Sample execution failed",
   });
 }
@@ -211,4 +238,8 @@ export function fetchStudentOverview() {
 
 export function fetchExecutionSecurityStatus() {
   return request("/execution/security-status", { errorMessage: "Failed to load execution security status" });
+}
+
+export function fetchExecutionMetrics() {
+  return request("/execution/metrics", { errorMessage: "Failed to load execution metrics" });
 }

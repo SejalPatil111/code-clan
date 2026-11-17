@@ -1,27 +1,21 @@
 """
-Isolated sandbox execution engine using gVisor (`runsc`) or an explicit,
-non-production Docker (`runc`) development fallback.
+Isolated sandbox executor (gVisor `runsc` in production, labelled `runc` fallback in development).
 
-Every compilation and every single test case runs inside a brand-new, disposable
-container launched from `codeclan-sandbox:latest` with:
-  - `--runtime runsc` (gVisor user-space kernel on supported Linux hosts; or explicit
-    `runc` development fallback when `EXECUTION_ENV=development` and
-    `SANDBOX_ALLOW_DEV_FALLBACK=true`)
-  - `--network none` (complete network isolation)
-  - `--ipc none` (private/disabled IPC namespace)
-  - `--read-only` root filesystem
-  - `--tmpfs /work:rw,exec,nosuid,nodev,size=32m,mode=1777` (ephemeral RAM workspace)
-  - `--tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777` (noexec scratch tmpfs)
-  - `--memory 256m --memory-swap 256m` (hard memory ceiling, zero swap)
-  - `--cpus 0.5` (CPU quota)
-  - `--pids-limit 64` (cgroup fork-bomb ceiling)
-  - `--ulimit nofile=64:64`, `--ulimit nproc=64:64`, `--ulimit fsize=16777216:16777216`, `--ulimit core=0:0`
-  - `--cap-drop ALL` and `--security-opt no-new-privileges`
-  - `--user 65534:65534` (unprivileged `nobody:nogroup`)
-  - No host filesystem mounts (`-v` is never used)
-  - No Docker socket or backend/database environment variables inside the sandbox
-  - `shell=False` everywhere
-  - Guaranteed container destruction in a `finally` block after every run
+Every container follows the same hardened lifecycle:
+
+    docker create  (all isolation flags, approved image, fixed runner command)
+    docker inspect (VERIFY the container that will run student code really has the expected runtime,
+                    network=none, read-only rootfs, non-privileged, no bind mounts, user 65534)
+    docker start -a -i  (stream stdin/stdout, bounded output, wall-clock timeout)
+    docker rm -f   (ALWAYS, in `finally`)
+
+Isolation flags: --runtime <runsc|runc> --network none --ipc none --read-only
+  --tmpfs /work (exec) --tmpfs /tmp (noexec) --memory/--memory-swap --cpus --pids-limit
+  --ulimit nofile/fsize/core --cap-drop ALL --security-opt no-new-privileges --user 65534:65534
+No host mounts, no Docker socket, no environment variables are passed to the container.
+
+`--ulimit nproc` is intentionally NOT used: RLIMIT_NPROC is accounted per *host UID*, so on runc several
+concurrent sandboxes (all uid 65534) would starve each other. The cgroup `--pids-limit` is per container.
 """
 
 import base64
@@ -32,7 +26,7 @@ import os
 import subprocess
 import threading
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 import uuid
 
 from app.grading.comparison import (
@@ -46,6 +40,7 @@ from app.grading.comparison import (
     compare_outputs,
     normalize_language,
 )
+from app.grading.environments import ENVIRONMENTS, Environment, effective_profile, get_environment
 
 logger = logging.getLogger("codeclan.sandbox")
 
@@ -57,29 +52,14 @@ CPU_LIMIT = os.getenv("SANDBOX_CPUS", "0.5")
 PIDS_LIMIT = int(os.getenv("SANDBOX_PIDS_LIMIT", "64"))
 NOFILE_LIMIT = int(os.getenv("SANDBOX_NOFILE_LIMIT", "64"))
 FSIZE_LIMIT_MB = int(os.getenv("SANDBOX_FSIZE_MB", "16"))
-MAX_OUTPUT_BYTES = int(os.getenv("SANDBOX_MAX_OUTPUT_BYTES", str(64 * 1024)))  # 64 KB
+MAX_OUTPUT_BYTES = int(os.getenv("SANDBOX_MAX_OUTPUT_BYTES", str(64 * 1024)))
 MAX_ERROR_CHARS = 4000
+STARTUP_ALLOWANCE_SECONDS = float(os.getenv("SANDBOX_STARTUP_ALLOWANCE", "6.0"))  # create+inspect+start overhead
 
 EXECUTION_ENV = os.getenv("EXECUTION_ENV", "development").strip().lower()
 REQUESTED_RUNTIME = os.getenv("SANDBOX_RUNTIME", "runsc").strip() or "runsc"
-REQUIRE_GVISOR = (
-    os.getenv(
-        "SANDBOX_REQUIRE_GVISOR",
-        "true" if EXECUTION_ENV == "production" else "false",
-    )
-    .strip()
-    .lower()
-    == "true"
-)
-ALLOW_DEV_FALLBACK = (
-    os.getenv(
-        "SANDBOX_ALLOW_DEV_FALLBACK",
-        "false" if EXECUTION_ENV == "production" else "true",
-    )
-    .strip()
-    .lower()
-    == "true"
-)
+REQUIRE_GVISOR = os.getenv("SANDBOX_REQUIRE_GVISOR", "true" if EXECUTION_ENV == "production" else "false").strip().lower() == "true"
+ALLOW_DEV_FALLBACK = os.getenv("SANDBOX_ALLOW_DEV_FALLBACK", "false" if EXECUTION_ENV == "production" else "true").strip().lower() == "true"
 
 
 @dataclass
@@ -97,6 +77,11 @@ class RuntimeSecurityStatus:
     security_mode: str
     message: str
     warnings: List[str] = field(default_factory=list)
+    # Evidence from REAL student/evaluator containers (not just a startup probe)
+    containers_verified: Dict[str, int] = field(default_factory=dict)
+    container_verification_failures: int = 0
+    last_container_verified_runtime: str = ""
+    runtime_check_method: str = "startup probe + per-container docker inspect (HostConfig.Runtime)"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -117,342 +102,173 @@ class SingleTestExecutionResult:
     actual_output: str
     execution_time_ms: float
     error_message: Optional[str] = None
+    stderr: str = ""
+    memory_kb: int = 0
+
+
+@dataclass
+class ProjectRunResult:
+    ok: bool                       # container ran and returned a parsable envelope
+    stage: str = "run"
+    internal_error: bool = False
+    error_message: Optional[str] = None
+    setup_error: Optional[str] = None
+    returncode: int = -1
+    timed_out: bool = False
+    output_exceeded: bool = False
+    stdout: str = ""
+    stderr: str = ""
+    max_rss_kb: int = 0
+    cpu_ms: float = 0.0
+    wall_ms: float = 0.0
+    files: Dict[str, bytes] = field(default_factory=dict)
+    files_truncated: bool = False
+    result_json: str = ""
+    harness_results: List[dict] = field(default_factory=list)
+
+    @property
+    def exit_code(self) -> int:
+        return self.returncode
+
+    @property
+    def execution_time_ms(self) -> float:
+        return self.wall_ms
+
+    @property
+    def oom_killed(self) -> bool:
+        return (
+            self.returncode == 137
+            or "MemoryError" in self.stderr
+            or "bad_alloc" in self.stderr
+            or "OutOfMemoryError" in self.stderr
+        )
+
+    @property
+    def output_limit_exceeded(self) -> bool:
+        return self.output_exceeded
+
+    @property
+    def output_files(self) -> List[dict]:
+        return [
+            {
+                "name": k,
+                "size_bytes": len(v),
+                "content_b64": base64.b64encode(v).decode("ascii"),
+            }
+            for k, v in self.files.items()
+        ]
+
+    @property
+    def evaluation(self) -> dict:
+        if not self.result_json:
+            return {}
+        try:
+            parsed = json.loads(self.result_json)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+
+# ------------------------------------------------------------------ docker helpers
+def _docker(args: List[str], timeout: float = 15.0, input_bytes: Optional[bytes] = None) -> subprocess.CompletedProcess:
+    return subprocess.run(["docker", *args], capture_output=True, timeout=timeout, shell=False, input=input_bytes)
 
 
 def _force_remove_container(container_name: str) -> None:
     try:
-        subprocess.run(
-            ["docker", "rm", "-f", container_name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-            shell=False,
-        )
+        subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=8, shell=False)
     except Exception:
         pass
 
 
 def list_active_sandbox_containers() -> List[str]:
-    """Return names of any existing `codeclan-sbx-*` containers (running or exited)."""
-    try:
-        res = subprocess.run(
-            ["docker", "ps", "-a", "--filter", "name=codeclan-sbx-", "--format", "{{.Names}}"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            shell=False,
-        )
-        if res.returncode != 0:
-            return []
-        return [line.strip() for line in res.stdout.splitlines() if line.strip()]
-    except Exception:
-        return []
+    """Names of existing `codeclan-sbx-*` / `codeclan-evl-*` containers (running or exited)."""
+    names: List[str] = []
+    for prefix in ("codeclan-sbx-", "codeclan-evl-"):
+        try:
+            res = subprocess.run(["docker", "ps", "-a", "--filter", f"name={prefix}", "--format", "{{.Names}}"],
+                                 capture_output=True, text=True, timeout=8, shell=False)
+            if res.returncode == 0:
+                names += [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
+        except Exception:
+            pass
+    return names
 
 
-def _probe_runtime_kernel(runtime: str) -> tuple[bool, str, str]:
-    """
-    Launch a minimal ephemeral container with `--runtime <runtime>` to read
-    `/proc/version` and verify whether the runtime works and whether the kernel
-    is gVisor's user-space Sentry kernel.
-    """
-    probe_name = f"codeclan-sbx-probe-{uuid.uuid4().hex[:8]}"
-    cmd = [
-        "docker",
-        "run",
-        "--rm",
-        "--name",
-        probe_name,
-        "--runtime",
-        runtime,
-        "--network",
-        "none",
-        "--read-only",
-        "--cap-drop",
-        "ALL",
-        "--security-opt",
-        "no-new-privileges",
-        "--user",
-        "65534:65534",
-        SANDBOX_IMAGE,
-        "/bin/cat",
-        "/proc/version",
+def build_create_command(name: str, image: str, mode: str, runtime: str, prof: Dict[str, float], kind: str = "sbx") -> List[str]:
+    """`docker create` argv for one sandbox. All values come from the registry/profile, never from students."""
+    mem = int(prof["memory_mb"])
+    fsize = int(prof.get("fsize_mb", FSIZE_LIMIT_MB)) * 1024 * 1024
+    nofile = int(prof.get("nofile", NOFILE_LIMIT))
+    return [
+        "create", "--pull", "never", "--name", name, "--runtime", runtime,
+        "--network", "none", "--ipc", "none", "--read-only",
+        "--tmpfs", f"/work:rw,exec,nosuid,nodev,size={int(prof['tmpfs_work_mb'])}m,mode=1777",
+        "--tmpfs", f"/tmp:rw,noexec,nosuid,nodev,size={int(prof.get('tmpfs_tmp_mb', 16))}m,mode=1777",
+        "--workdir", "/work",
+        "--memory", f"{mem}m", "--memory-swap", f"{mem}m",
+        "--cpus", str(prof["cpus"]), "--pids-limit", str(int(prof["pids"])),
+        "--ulimit", f"nofile={nofile}:{nofile}",
+        "--ulimit", f"fsize={fsize}:{fsize}",
+        "--ulimit", "core=0:0",
+        "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+        "--user", "65534:65534", "-i",
+        image, "/usr/local/bin/sandbox-runner", mode,
     ]
+
+
+def _verify_container(name: str, expected_runtime: str) -> Tuple[bool, str, str]:
+    """Inspect the CREATED container and confirm it has the isolation settings we require."""
+    fmt = ("{{.HostConfig.Runtime}}|{{.HostConfig.Privileged}}|{{.HostConfig.NetworkMode}}|"
+           "{{.HostConfig.ReadonlyRootfs}}|{{len .HostConfig.Binds}}|{{.Config.User}}|{{len .HostConfig.Devices}}")
     try:
-        res = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=8,
-            shell=False,
-        )
-        if res.returncode != 0:
-            return False, "", (res.stderr or res.stdout or f"exit {res.returncode}").strip()
-        proc_version = (res.stdout or "").strip()
-        return True, proc_version, ""
+        res = _docker(["inspect", "-f", fmt, name], timeout=10)
     except Exception as exc:
-        return False, "", str(exc)
-    finally:
-        _force_remove_container(probe_name)
+        return False, "", f"inspect failed: {exc}"
+    if res.returncode != 0:
+        return False, "", (res.stderr or b"").decode("utf-8", "replace").strip()[:300]
+    got = res.stdout.decode("utf-8", "replace").strip()
+    parts = got.split("|")
+    expected = [expected_runtime, "false", "none", "true", "0", "65534:65534", "0"]
+    if len(parts) != 7 or parts != expected:
+        return False, parts[0] if parts else "", f"container settings mismatch: got {got!r}, expected {'|'.join(expected)!r}"
+    return True, parts[0], ""
 
 
-def detect_and_verify_sandbox_runtime(
-    execution_env: str = EXECUTION_ENV,
-    requested_runtime: str = REQUESTED_RUNTIME,
-    require_gvisor: bool = REQUIRE_GVISOR,
-    allow_dev_fallback: bool = ALLOW_DEV_FALLBACK,
-) -> RuntimeSecurityStatus:
-    """
-    Inspect the Docker daemon's registered OCI runtimes and actively verify
-    whether gVisor (`runsc`) is operational.
-
-    - Never claims gVisor is active unless `runsc` is registered AND a live probe
-      container confirms execution under the gVisor Sentry kernel.
-    - Fails closed (`blocked=True`) when `require_gvisor=True`, `execution_env == 'production'`,
-      or `allow_dev_fallback=False` and `runsc` is unavailable.
-    - Uses `runc` only as an explicit, non-production development fallback when allowed.
-    """
-    env_norm = (execution_env or "development").strip().lower()
-    req_rt = (requested_runtime or "runsc").strip()
-    must_have_gvisor = require_gvisor or (env_norm == "production") or (not allow_dev_fallback)
-
-    available_runtimes: List[str] = []
-    host_kernel = "unknown"
-    daemon_os = "unknown"
-
-    try:
-        info_res = subprocess.run(
-            [
-                "docker",
-                "info",
-                "--format",
-                "{{json .Runtimes}}|{{.KernelVersion}}|{{.OperatingSystem}}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=8,
-            shell=False,
-        )
-        if info_res.returncode == 0 and info_res.stdout.strip():
-            parts = info_res.stdout.strip().split("|")
-            if len(parts) >= 1 and parts[0]:
-                rt_map = json.loads(parts[0])
-                if isinstance(rt_map, dict):
-                    available_runtimes = sorted(rt_map.keys())
-            if len(parts) >= 2 and parts[1]:
-                host_kernel = parts[1].strip()
-            if len(parts) >= 3 and parts[2]:
-                daemon_os = parts[2].strip()
-        else:
-            err_msg = (info_res.stderr or info_res.stdout or "docker info failed").strip()
-            return RuntimeSecurityStatus(
-                execution_env=env_norm,
-                requested_runtime=req_rt,
-                active_runtime="none",
-                available_runtimes=[],
-                host_kernel="unreachable",
-                sandbox_kernel="unreachable",
-                gvisor_verified=False,
-                fallback_active=False,
-                production_secure=False,
-                blocked=True,
-                security_mode="BLOCKED_DOCKER_DAEMON_UNAVAILABLE",
-                message=f"Cannot inspect Docker daemon runtimes: {err_msg}",
-                warnings=[err_msg],
-            )
-    except Exception as exc:
-        return RuntimeSecurityStatus(
-            execution_env=env_norm,
-            requested_runtime=req_rt,
-            active_runtime="none",
-            available_runtimes=[],
-            host_kernel="unreachable",
-            sandbox_kernel="unreachable",
-            gvisor_verified=False,
-            fallback_active=False,
-            production_secure=False,
-            blocked=True,
-            security_mode="BLOCKED_DOCKER_DAEMON_UNAVAILABLE",
-            message=f"Docker daemon check failed: {exc}",
-            warnings=[str(exc)],
-        )
-
-    # 1. If `runsc` is registered, actively verify it with a live probe container
-    if "runsc" in available_runtimes and req_rt == "runsc":
-        ok, proc_ver, err = _probe_runtime_kernel("runsc")
-        # gVisor's Sentry kernel reports e.g. "Linux version 4.4.0 ..." (distinct from host kernel)
-        is_gvisor_kernel = ok and (
-            "4.4.0" in proc_ver
-            or "gvisor" in proc_ver.lower()
-            or (host_kernel != "unknown" and host_kernel not in proc_ver)
-        )
-        if ok and is_gvisor_kernel:
-            logger.info(
-                "Verified gVisor (runsc) sandbox isolation. Host kernel=%s, Sandbox kernel=%s",
-                host_kernel,
-                proc_ver,
-            )
-            return RuntimeSecurityStatus(
-                execution_env=env_norm,
-                requested_runtime=req_rt,
-                active_runtime="runsc",
-                available_runtimes=available_runtimes,
-                host_kernel=host_kernel,
-                sandbox_kernel=proc_ver,
-                gvisor_verified=True,
-                fallback_active=False,
-                production_secure=True,
-                blocked=False,
-                security_mode="PRODUCTION_GVISOR_RUNSC_VERIFIED",
-                message="Student code executes inside verified gVisor (runsc) user-space kernel sandboxes.",
-                warnings=[],
-            )
-        probe_reason = err or f"Unexpected /proc/version under runsc: {proc_ver}"
-    else:
-        probe_reason = (
-            f"OCI runtime 'runsc' (gVisor) is not registered with Docker daemon "
-            f"(available runtimes: {', '.join(available_runtimes) or 'none'}; OS: {daemon_os})."
-        )
-
-    # 2. If gVisor is required (production mode or strict requirement), FAIL CLOSED
-    if must_have_gvisor:
-        block_msg = (
-            f"EXECUTION BLOCKED: Production gVisor ('runsc') isolation is required "
-            f"(execution_env={env_norm}, require_gvisor={require_gvisor}, allow_dev_fallback={allow_dev_fallback}), "
-            f"but verification failed: {probe_reason}"
-        )
-        logger.error(block_msg)
-        return RuntimeSecurityStatus(
-            execution_env=env_norm,
-            requested_runtime=req_rt,
-            active_runtime="none",
-            available_runtimes=available_runtimes,
-            host_kernel=host_kernel,
-            sandbox_kernel="none",
-            gvisor_verified=False,
-            fallback_active=False,
-            production_secure=False,
-            blocked=True,
-            security_mode="BLOCKED_UNSAFE_RUNTIME_GVISOR_REQUIRED",
-            message=block_msg,
-            warnings=[probe_reason],
-        )
-
-    # 3. Development fallback to standard Docker `runc`
-    fallback_rt = "runc" if "runc" in available_runtimes else (available_runtimes[0] if available_runtimes else "runc")
-    ok_fb, fb_proc_ver, fb_err = _probe_runtime_kernel(fallback_rt)
-    sandbox_kernel_str = fb_proc_ver if ok_fb else f"shared-host-kernel ({host_kernel})"
-    warning_msg = (
-        f"DEVELOPMENT FALLBACK ACTIVE (NOT PRODUCTION SECURE): {probe_reason} "
-        f"Using standard Docker OCI runtime '{fallback_rt}' with hardened flags "
-        f"(--network none, --ipc none, --read-only, --cap-drop ALL, no-new-privileges, "
-        f"cgroups, rlimits, uid 65534). Student containers share the Linux kernel ({host_kernel}). "
-        f"Do NOT expose this instance to untrusted public traffic without installing gVisor (runsc) on a Linux host."
-    )
-    logger.warning(warning_msg)
-    return RuntimeSecurityStatus(
-        execution_env=env_norm,
-        requested_runtime=req_rt,
-        active_runtime=fallback_rt,
-        available_runtimes=available_runtimes,
-        host_kernel=host_kernel,
-        sandbox_kernel=sandbox_kernel_str,
-        gvisor_verified=False,
-        fallback_active=True,
-        production_secure=False,
-        blocked=False,
-        security_mode="DEVELOPMENT_FALLBACK_DOCKER_RUNC (NOT_PRODUCTION_SECURE)",
-        message=(
-            f"Running in local development fallback mode with Docker '{fallback_rt}' runtime "
-            f"(gVisor 'runsc' unavailable on {daemon_os}). NOT production-secure."
-        ),
-        warnings=[warning_msg] + ([fb_err] if fb_err else []),
-    )
-
-
-def _run_bounded_process(
-    cmd: List[str],
-    stdin_bytes: bytes,
-    timeout_sec: float,
-    max_output_bytes: int,
-    container_name: str,
-) -> dict:
-    """
-    Run `cmd` (`shell=False`), stream `stdin_bytes`, read stdout/stderr up to
-    `max_output_bytes`, and enforce `timeout_sec`. Kills and removes the container
-    if the wall-clock timeout or output cap is exceeded, and ALWAYS force-removes
-    the container in a `finally` block so no sandbox container ever lingers.
-    """
+def _run_bounded_process(cmd: List[str], stdin_bytes: bytes, timeout_sec: float, max_output_bytes: int, container_name: str) -> dict:
+    """Run `docker start -a -i`, enforce wall-clock timeout & output caps. Always removes the container."""
     start_ts = time.perf_counter()
     proc = None
     try:
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                shell=False,
-            )
-        except FileNotFoundError as exc:
-            return {
-                "returncode": -1,
-                "stdout": "",
-                "stderr": f"Docker CLI not found: {exc}",
-                "timed_out": False,
-                "output_exceeded": False,
-                "elapsed_ms": 0.0,
-                "internal_error": True,
-            }
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
         except Exception as exc:
-            return {
-                "returncode": -1,
-                "stdout": "",
-                "stderr": f"Failed to start sandbox container: {exc}",
-                "timed_out": False,
-                "output_exceeded": False,
-                "elapsed_ms": 0.0,
-                "internal_error": True,
-            }
+            return {"returncode": -1, "stdout": "", "stderr": f"Failed to start sandbox container: {exc}",
+                    "timed_out": False, "output_exceeded": False, "elapsed_ms": 0.0, "internal_error": True}
 
-        stdout_chunks: List[bytes] = []
-        stderr_chunks: List[bytes] = []
-        stdout_total = 0
-        stderr_total = 0
-        output_exceeded = False
+        chunks = {"out": [], "err": []}
+        totals = {"out": 0, "err": 0}
+        state = {"exceeded": False}
 
-        def _read_stream(pipe, chunks: List[bytes], is_stdout: bool):
-            nonlocal stdout_total, stderr_total, output_exceeded
+        def _read(pipe, key):
             try:
                 while True:
-                    chunk = pipe.read(4096)
+                    chunk = pipe.read(8192)
                     if not chunk:
                         break
-                    if is_stdout:
-                        if stdout_total < max_output_bytes:
-                            take = min(len(chunk), max_output_bytes - stdout_total)
-                            chunks.append(chunk[:take])
-                        stdout_total += len(chunk)
-                        if stdout_total > max_output_bytes and not output_exceeded:
-                            output_exceeded = True
-                            _force_remove_container(container_name)
-                            try:
-                                proc.kill()
-                            except Exception:
-                                pass
-                            break
-                    else:
-                        if stderr_total < max_output_bytes:
-                            take = min(len(chunk), max_output_bytes - stderr_total)
-                            chunks.append(chunk[:take])
-                        stderr_total += len(chunk)
-                        if stderr_total > max_output_bytes and not output_exceeded:
-                            output_exceeded = True
-                            _force_remove_container(container_name)
-                            try:
-                                proc.kill()
-                            except Exception:
-                                pass
-                            break
+                    if totals[key] < max_output_bytes:
+                        take = min(len(chunk), max_output_bytes - totals[key])
+                        chunks[key].append(chunk[:take])
+                    totals[key] += len(chunk)
+                    if totals[key] > max_output_bytes and not state["exceeded"]:
+                        state["exceeded"] = True
+                        _force_remove_container(container_name)
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        break
             except Exception:
                 pass
             finally:
@@ -461,24 +277,24 @@ def _run_bounded_process(
                 except Exception:
                     pass
 
-        t_out = threading.Thread(target=_read_stream, args=(proc.stdout, stdout_chunks, True), daemon=True)
-        t_err = threading.Thread(target=_read_stream, args=(proc.stderr, stderr_chunks, False), daemon=True)
+        t_out = threading.Thread(target=_read, args=(proc.stdout, "out"), daemon=True)
+        t_err = threading.Thread(target=_read, args=(proc.stderr, "err"), daemon=True)
         t_out.start()
         t_err.start()
 
-        try:
-            if proc.stdin:
+        def _feed():
+            try:
+                proc.stdin.write(stdin_bytes)
+            except Exception:
+                pass
+            finally:
                 try:
-                    proc.stdin.write(stdin_bytes)
-                except BrokenPipeError:
+                    proc.stdin.close()
+                except Exception:
                     pass
-                finally:
-                    try:
-                        proc.stdin.close()
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+
+        t_in = threading.Thread(target=_feed, daemon=True)
+        t_in.start()
 
         timed_out = False
         try:
@@ -491,310 +307,524 @@ def _run_bounded_process(
             except Exception:
                 pass
             try:
-                proc.wait(timeout=2)
+                proc.wait(timeout=3)
             except Exception:
                 pass
-
-        t_out.join(timeout=2)
-        t_err.join(timeout=2)
-        elapsed_ms = round((time.perf_counter() - start_ts) * 1000.0, 2)
-
-        stdout_str = b"".join(stdout_chunks).decode("utf-8", errors="replace")
-        stderr_str = b"".join(stderr_chunks).decode("utf-8", errors="replace")
-
+        t_out.join(timeout=3)
+        t_err.join(timeout=3)
         return {
             "returncode": proc.returncode if proc.returncode is not None else -1,
-            "stdout": stdout_str,
-            "stderr": stderr_str,
-            "timed_out": timed_out,
-            "output_exceeded": output_exceeded,
-            "elapsed_ms": elapsed_ms,
-            "internal_error": False,
+            "stdout": b"".join(chunks["out"]).decode("utf-8", errors="replace"),
+            "stderr": b"".join(chunks["err"]).decode("utf-8", errors="replace"),
+            "timed_out": timed_out, "output_exceeded": state["exceeded"],
+            "elapsed_ms": round((time.perf_counter() - start_ts) * 1000.0, 2), "internal_error": False,
         }
     finally:
-        # Guaranteed cleanup regardless of exit path (normal, error, OOM, timeout, output flood)
         _force_remove_container(container_name)
 
 
-def _build_docker_run_cmd(container_name: str, mode: str, runtime: str = "runc") -> List[str]:
-    fsize_bytes = FSIZE_LIMIT_MB * 1024 * 1024
-    return [
-        "docker",
-        "run",
-        "--rm",
-        "-i",
-        "--name",
-        container_name,
-        "--runtime",
-        runtime,
-        "--network",
-        "none",
-        "--ipc",
-        "none",
-        "--read-only",
-        "--tmpfs",
-        "/work:rw,exec,nosuid,nodev,size=32m,mode=1777",
-        "--tmpfs",
-        "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777",
-        "--workdir",
-        "/work",
-        "--memory",
-        f"{MEMORY_LIMIT_MB}m",
-        "--memory-swap",
-        f"{MEMORY_LIMIT_MB}m",
-        "--cpus",
-        str(CPU_LIMIT),
-        "--pids-limit",
-        str(PIDS_LIMIT),
-        "--ulimit",
-        f"nofile={NOFILE_LIMIT}:{NOFILE_LIMIT}",
-        "--ulimit",
-        f"nproc={PIDS_LIMIT}:{PIDS_LIMIT}",
-        "--ulimit",
-        f"fsize={fsize_bytes}:{fsize_bytes}",
-        "--ulimit",
-        "core=0:0",
-        "--cap-drop",
-        "ALL",
-        "--security-opt",
-        "no-new-privileges",
-        "--user",
-        "65534:65534",
-        SANDBOX_IMAGE,
-        "/usr/local/bin/sandbox-runner",
-        mode,
-    ]
+def _probe_runtime(runtime: str, image: str = SANDBOX_IMAGE) -> Tuple[bool, dict, str]:
+    """Create + inspect-verify + start a throw-away container in `runtime`; return runner probe JSON."""
+    name = f"codeclan-sbx-probe-{uuid.uuid4().hex[:10]}"
+    prof = effective_profile(get_environment("cp"))
+    try:
+        res = _docker(build_create_command(name, image, "probe", runtime, prof), timeout=30)
+        if res.returncode != 0:
+            return False, {}, (res.stderr or res.stdout or b"").decode("utf-8", "replace").strip()[:400]
+        ok, _rt, why = _verify_container(name, runtime)
+        if not ok:
+            return False, {}, why
+        run = _docker(["start", "-a", "-i", name], timeout=30, input_bytes=b"")
+        if run.returncode != 0:
+            return False, {}, (run.stderr or run.stdout or b"").decode("utf-8", "replace").strip()[:400]
+        return True, json.loads(run.stdout.decode("utf-8", "replace")), ""
+    except Exception as exc:
+        return False, {}, str(exc)
+    finally:
+        _force_remove_container(name)
+
+
+def _status(env, req, active, avail, hk, sk, gv, fb, ps, blocked, mode, msg, warnings=None) -> RuntimeSecurityStatus:
+    return RuntimeSecurityStatus(execution_env=env, requested_runtime=req, active_runtime=active, available_runtimes=avail,
+                                 host_kernel=hk, sandbox_kernel=sk, gvisor_verified=gv, fallback_active=fb,
+                                 production_secure=ps, blocked=blocked, security_mode=mode, message=msg,
+                                 warnings=warnings or [])
+
+
+def detect_and_verify_sandbox_runtime(
+    execution_env: str = EXECUTION_ENV,
+    requested_runtime: str = REQUESTED_RUNTIME,
+    require_gvisor: bool = REQUIRE_GVISOR,
+    allow_dev_fallback: bool = ALLOW_DEV_FALLBACK,
+) -> RuntimeSecurityStatus:
+    """
+    Decide which runtime student code will use, VERIFIED by actually creating/inspecting/starting a container.
+    `docker info` is optional (the production policy proxy denies it); it is only used for display.
+    Fails closed when gVisor is required and cannot be verified.
+    """
+    env_norm = (execution_env or "development").strip().lower()
+    req_rt = (requested_runtime or "runsc").strip()
+    must = require_gvisor or env_norm == "production" or not allow_dev_fallback
+
+    available: List[str] = []
+    host_kernel = "unknown (docker info unavailable)"
+    info_known = False
+    try:
+        info = _docker(["info", "--format", "{{json .Runtimes}}|{{.KernelVersion}}"], timeout=10)
+        if info.returncode == 0 and info.stdout.strip():
+            a, _, k = info.stdout.decode().strip().partition("|")
+            available = sorted(json.loads(a).keys())
+            host_kernel = k.strip() or host_kernel
+            info_known = True
+    except Exception:
+        pass
+
+    probe_reason = ""
+    if req_rt == "runsc" and (not info_known or "runsc" in available):
+        ok, data, err = _probe_runtime("runsc")
+        pv = (data or {}).get("proc_version", "")
+        is_gv = ok and ("4.4.0" in pv or "gvisor" in pv.lower() or (info_known and host_kernel not in pv))
+        if ok and is_gv:
+            return RuntimeSecurityStatus(
+                execution_env=env_norm, requested_runtime=req_rt, active_runtime="runsc", available_runtimes=available,
+                host_kernel=host_kernel, sandbox_kernel=pv, gvisor_verified=True, fallback_active=False,
+                production_secure=True, blocked=False, security_mode="PRODUCTION_GVISOR_RUNSC_VERIFIED",
+                message="Student code executes in containers created with runtime 'runsc'; the probe container "
+                        "reports a gVisor-style kernel identity.",
+                warnings=["Kernel identity is a heuristic; the authoritative checks are HostConfig.Runtime=runsc "
+                          "(verified on every container) and the gVisor runtime installed on the host."],
+            )
+        probe_reason = err or f"runsc started but kernel identity does not look like gVisor: {pv!r}"
+    else:
+        probe_reason = (f"runtime 'runsc' is not registered with the Docker daemon (registered: {', '.join(available) or 'none'})"
+                        if info_known else f"requested runtime {req_rt!r} is not runsc")
+
+    if must:
+        msg = (f"EXECUTION BLOCKED: gVisor (runsc) is required (env={env_norm}, require_gvisor={require_gvisor}, "
+               f"allow_dev_fallback={allow_dev_fallback}) but could not be verified: {probe_reason}")
+        logger.error(msg)
+        return _status(env_norm, req_rt, "none", available, host_kernel, "none", False, False, False, True,
+                       "BLOCKED_UNSAFE_RUNTIME_GVISOR_REQUIRED", msg, [probe_reason])
+
+    ok, data, err = _probe_runtime("runc")
+    if not ok:
+        msg = f"Docker 'runc' fallback probe failed: {err}"
+        return _status(env_norm, req_rt, "none", available, host_kernel, "none", False, False, False, True,
+                       "BLOCKED_NO_USABLE_RUNTIME", msg, [probe_reason, err])
+    warn = (f"DEVELOPMENT FALLBACK ACTIVE (NOT PRODUCTION SECURE): {probe_reason}. Using Docker 'runc' with hardened "
+            f"flags; sandboxes share the host Linux kernel ({host_kernel}). Do not expose to untrusted public users.")
+    logger.warning(warn)
+    return _status(env_norm, req_rt, "runc", available, host_kernel, (data or {}).get("proc_version", "shared host kernel"),
+                   False, True, False, False, "DEVELOPMENT_FALLBACK_DOCKER_RUNC (NOT_PRODUCTION_SECURE)",
+                   "Local development fallback with Docker 'runc'. NOT production-secure.", [warn])
 
 
 class SandboxExecutor:
-    """
-    Executes compilation and individual test cases inside isolated containers
-    using gVisor (`runsc`) in production or an explicitly marked `runc` fallback
-    in local development.
-    """
+    """Runs compilation, tests, projects and evaluators in verified, ephemeral containers."""
 
-    def __init__(
-        self,
-        execution_env: str = EXECUTION_ENV,
-        requested_runtime: str = REQUESTED_RUNTIME,
-        require_gvisor: bool = REQUIRE_GVISOR,
-        allow_dev_fallback: bool = ALLOW_DEV_FALLBACK,
-    ):
-        self.runtime_status: RuntimeSecurityStatus = detect_and_verify_sandbox_runtime(
-            execution_env=execution_env,
-            requested_runtime=requested_runtime,
-            require_gvisor=require_gvisor,
-            allow_dev_fallback=allow_dev_fallback,
-        )
+    def __init__(self, execution_env: str = EXECUTION_ENV, requested_runtime: str = REQUESTED_RUNTIME,
+                 require_gvisor: bool = REQUIRE_GVISOR, allow_dev_fallback: bool = ALLOW_DEV_FALLBACK):
+        self._lock = threading.Lock()
+        self.runtime_status = detect_and_verify_sandbox_runtime(execution_env, requested_runtime, require_gvisor, allow_dev_fallback)
 
     def get_runtime_status(self, refresh: bool = False) -> RuntimeSecurityStatus:
         if refresh:
-            self.runtime_status = detect_and_verify_sandbox_runtime(
-                execution_env=self.runtime_status.execution_env,
-                requested_runtime=self.runtime_status.requested_runtime,
-                require_gvisor=REQUIRE_GVISOR,
-                allow_dev_fallback=ALLOW_DEV_FALLBACK,
-            )
+            old = self.runtime_status
+            new = detect_and_verify_sandbox_runtime(old.execution_env, old.requested_runtime, REQUIRE_GVISOR, ALLOW_DEV_FALLBACK)
+            new.containers_verified, new.container_verification_failures = old.containers_verified, old.container_verification_failures
+            self.runtime_status = new
         return self.runtime_status
 
-    def compile_source(self, language: str, code: str) -> CompileResult:
-        if self.runtime_status.blocked:
-            return CompileResult(
-                ok=False,
-                error_message=self.runtime_status.message,
-                status=STATUS_INTERNAL_ERROR,
-            )
+    # ----------------------------------------------------------- core container lifecycle
+    def _container(self, env: Environment, mode: str, payload: dict, prof: Dict[str, float], wall_timeout: float,
+                   max_output_bytes: int, kind: str = "sbx") -> dict:
+        st = self.runtime_status
+        if st.blocked:
+            return {"returncode": -1, "stdout": "", "stderr": st.message, "timed_out": False, "output_exceeded": False,
+                    "elapsed_ms": 0.0, "internal_error": True}
+        runtime = st.active_runtime
+        name = f"codeclan-{kind}-{mode.replace('_', '')[:7]}-{uuid.uuid4().hex[:12]}"
+        t0 = time.perf_counter()
+        try:
+            cr = _docker(build_create_command(name, env.image, mode, runtime, prof, kind), timeout=40)
+            if cr.returncode != 0:
+                err = (cr.stderr or cr.stdout or b"").decode("utf-8", "replace").strip()
+                if "No such image" in err or "pull access denied" in err:
+                    err = f"Execution environment image '{env.id}' is not built on this host. Run scripts/build-envs. ({err[:200]})"
+                return {"returncode": -1, "stdout": "", "stderr": f"Sandbox create failed: {err[:MAX_ERROR_CHARS]}",
+                        "timed_out": False, "output_exceeded": False, "elapsed_ms": 0.0, "internal_error": True}
+            ok, got_rt, why = _verify_container(name, runtime)
+            if not ok:
+                with self._lock:
+                    st.container_verification_failures += 1
+                    if got_rt and got_rt != runtime and st.execution_env == "production":
+                        st.blocked = True
+                        st.security_mode = "BLOCKED_RUNTIME_MISMATCH_DETECTED"
+                        st.message = f"Container reported runtime {got_rt!r}, expected {runtime!r}. Execution blocked."
+                logger.error("Sandbox verification failed for %s: %s", name, why)
+                return {"returncode": -1, "stdout": "", "stderr": f"Sandbox verification failed: {why}", "timed_out": False,
+                        "output_exceeded": False, "elapsed_ms": 0.0, "internal_error": True}
+            with self._lock:
+                st.containers_verified[got_rt] = st.containers_verified.get(got_rt, 0) + 1
+                st.last_container_verified_runtime = got_rt
+            remaining = max(1.0, wall_timeout + STARTUP_ALLOWANCE_SECONDS - (time.perf_counter() - t0))
+            res = _run_bounded_process(["docker", "start", "-a", "-i", name], json.dumps(payload).encode("utf-8"),
+                                       remaining, max_output_bytes, name)
+            return res
+        except subprocess.TimeoutExpired:
+            return {"returncode": -1, "stdout": "", "stderr": "Docker daemon did not respond in time.", "timed_out": False,
+                    "output_exceeded": False, "elapsed_ms": 0.0, "internal_error": True}
+        finally:
+            _force_remove_container(name)
 
+    @staticmethod
+    def _encode_files_b64(files: Optional[Dict[str, str]], *, already_b64: bool = False) -> Tuple[Dict[str, str], int]:
+        if not files:
+            return {}, 0
+        encoded: Dict[str, str] = {}
+        total_raw = 0
+        for rel, val in files.items():
+            if already_b64:
+                encoded[rel] = val
+                total_raw += len(val) * 3 // 4
+            else:
+                raw_bytes = (val or "").encode("utf-8")
+                total_raw += len(raw_bytes)
+                encoded[rel] = base64.b64encode(raw_bytes).decode("ascii")
+        return encoded, total_raw
+
+    @staticmethod
+    def _resolve_env(env: Optional[Environment] = None, image: Optional[str] = None) -> Environment:
+        if env is not None:
+            return env
+        if image:
+            for candidate in ENVIRONMENTS.values():
+                if candidate.image == image or candidate.id == image:
+                    return candidate
+        return get_environment("cp")
+
+    # ----------------------------------------------------------- compile
+    def compile_source(self, language: str, code: str = "", *, env: Optional[Environment] = None,
+                       files: Optional[Dict[str, str]] = None, entry_point: str = "",
+                       profile: Optional[Dict[str, float]] = None,
+                       files_are_b64: bool = False) -> CompileResult:
+        """`files` maps relative path -> source text (or base64 when `files_are_b64=True`)."""
         norm_lang = normalize_language(language)
         if not norm_lang:
-            return CompileResult(
-                ok=False,
-                error_message=f"Unsupported language: {language}",
-                status=STATUS_COMPILATION_ERROR,
-            )
+            return CompileResult(False, error_message=f"Unsupported language: {language}", status=STATUS_COMPILATION_ERROR)
+        env = env or get_environment("cp")
+        if norm_lang not in env.languages:
+            return CompileResult(False, error_message=f"Language '{norm_lang}' is not supported by environment '{env.id}'.",
+                                 status=STATUS_COMPILATION_ERROR)
+        prof = profile or effective_profile(env)
+        payload = {"language": norm_lang, "entry_point": entry_point or ""}
+        if files:
+            b64_files, total = self._encode_files_b64(files, already_b64=files_are_b64)
+            payload["files"] = b64_files
+        else:
+            if len(code.encode("utf-8")) > MAX_SOURCE_CODE_BYTES:
+                return CompileResult(False, error_message=f"Source code exceeds maximum allowed size ({MAX_SOURCE_CODE_BYTES} bytes).",
+                                     status=STATUS_COMPILATION_ERROR)
+            payload["code_b64"] = base64.b64encode(code.encode("utf-8")).decode("ascii")
+            total = len(code)
+        if total > int(prof.get("max_source_bytes", 262144)) * 4:
+            return CompileResult(False, error_message="Project exceeds the maximum allowed source size.", status=STATUS_COMPILATION_ERROR)
 
-        if len(code.encode("utf-8")) > MAX_SOURCE_CODE_BYTES:
-            return CompileResult(
-                ok=False,
-                error_message=f"Source code exceeds maximum allowed size ({MAX_SOURCE_CODE_BYTES} bytes).",
-                status=STATUS_COMPILATION_ERROR,
-            )
-
-        container_name = f"codeclan-sbx-cmp-{uuid.uuid4().hex[:12]}"
-        payload = {
-            "language": norm_lang,
-            "code_b64": base64.b64encode(code.encode("utf-8")).decode("ascii"),
-        }
-        cmd = _build_docker_run_cmd(container_name, "compile", runtime=self.runtime_status.active_runtime)
-        res = _run_bounded_process(
-            cmd=cmd,
-            stdin_bytes=json.dumps(payload).encode("utf-8"),
-            timeout_sec=COMPILE_TIMEOUT_SECONDS,
-            max_output_bytes=MAX_OUTPUT_BYTES * 4,  # allow base64 compiled binary tar
-            container_name=container_name,
-        )
-
+        res = self._container(env, "compile", payload, prof, float(prof.get("compile_timeout_sec", COMPILE_TIMEOUT_SECONDS)),
+                              max(MAX_OUTPUT_BYTES * 4, 4 * 1024 * 1024))
         if res["internal_error"]:
-            return CompileResult(
-                ok=False,
-                error_message=res["stderr"][:MAX_ERROR_CHARS],
-                status=STATUS_INTERNAL_ERROR,
-            )
-
+            return CompileResult(False, error_message=res["stderr"][:MAX_ERROR_CHARS], status=STATUS_INTERNAL_ERROR)
         if res["timed_out"]:
-            return CompileResult(
-                ok=False,
-                error_message=f"Compilation timed out after {COMPILE_TIMEOUT_SECONDS}s.",
-                status=STATUS_COMPILATION_ERROR,
-            )
-
+            return CompileResult(False, error_message=f"Compilation timed out after {prof.get('compile_timeout_sec', COMPILE_TIMEOUT_SECONDS)}s.",
+                                 status=STATUS_COMPILATION_ERROR)
         if res["returncode"] != 0:
             err = (res["stderr"] or res["stdout"] or "Compilation failed.").strip()
             if "Cannot connect to the Docker daemon" in err or "Unable to find image" in err or "Unknown runtime" in err:
-                return CompileResult(
-                    ok=False,
-                    error_message=f"Sandbox unavailable: {err[:MAX_ERROR_CHARS]}",
-                    status=STATUS_INTERNAL_ERROR,
-                )
-            return CompileResult(
-                ok=False,
-                error_message=err[:MAX_ERROR_CHARS],
-                status=STATUS_COMPILATION_ERROR,
-            )
-
+                return CompileResult(False, error_message=f"Sandbox unavailable: {err[:MAX_ERROR_CHARS]}", status=STATUS_INTERNAL_ERROR)
+            return CompileResult(False, error_message=err[:MAX_ERROR_CHARS], status=STATUS_COMPILATION_ERROR)
         try:
-            data = json.loads(res["stdout"])
-            return CompileResult(ok=True, artifact_b64=data.get("artifact_b64", ""))
+            return CompileResult(True, artifact_b64=json.loads(res["stdout"]).get("artifact_b64", ""))
         except Exception as exc:
-            return CompileResult(
-                ok=False,
-                error_message=f"Invalid compiler output from sandbox: {exc}",
-                status=STATUS_INTERNAL_ERROR,
-            )
+            return CompileResult(False, error_message=f"Invalid compiler output from sandbox: {exc}", status=STATUS_INTERNAL_ERROR)
 
-    def run_single_test(
-        self,
-        language: str,
-        code: str,
-        artifact_b64: str,
-        test_input: str,
-        expected_output: str,
-        timeout_sec: Optional[float] = None,
-    ) -> SingleTestExecutionResult:
-        if self.runtime_status.blocked:
-            return SingleTestExecutionResult(
-                status=STATUS_INTERNAL_ERROR,
-                passed=False,
-                actual_output="",
-                execution_time_ms=0.0,
-                error_message=self.runtime_status.message,
-            )
-
+    # ----------------------------------------------------------- legacy competitive run (stdout comparison)
+    def run_single_test(self, language: str, code: str, artifact_b64: str, test_input: str, expected_output: str,
+                        timeout_sec: Optional[float] = None, *, env: Optional[Environment] = None,
+                        files: Optional[Dict[str, str]] = None, entry_point: str = "",
+                        profile: Optional[Dict[str, float]] = None, comparator=None,
+                        files_are_b64: bool = False) -> SingleTestExecutionResult:
         norm_lang = normalize_language(language)
         if not norm_lang:
-            return SingleTestExecutionResult(
-                status=STATUS_COMPILATION_ERROR,
-                passed=False,
-                actual_output="",
-                execution_time_ms=0.0,
-                error_message=f"Unsupported language: {language}",
-            )
-
-        wall_timeout = timeout_sec if timeout_sec is not None else RUN_TIMEOUT_SECONDS
-        cpu_limit_int = max(1, int(wall_timeout) + 1)
-
-        container_name = f"codeclan-sbx-run-{uuid.uuid4().hex[:12]}"
+            return SingleTestExecutionResult(STATUS_COMPILATION_ERROR, False, "", 0.0, f"Unsupported language: {language}")
+        env = env or get_environment("cp")
+        prof = profile or effective_profile(env)
+        wall = timeout_sec if timeout_sec is not None else float(prof.get("wall_timeout_sec", RUN_TIMEOUT_SECONDS))
         payload = {
-            "language": norm_lang,
-            "code_b64": base64.b64encode(code.encode("utf-8")).decode("ascii") if norm_lang in ("python", "javascript") else "",
-            "artifact_b64": artifact_b64,
+            "language": norm_lang, "artifact_b64": artifact_b64, "entry_point": entry_point or "",
             "stdin_b64": base64.b64encode((test_input or "").encode("utf-8")).decode("ascii"),
-            "cpu_limit_sec": cpu_limit_int,
-            "fsize_limit_mb": 4,
-            "memory_limit_mb": MEMORY_LIMIT_MB,
-            "nproc_limit": 32,
-            "nofile_limit": NOFILE_LIMIT,
+            "cpu_limit_sec": max(1, int(wall) + 1), "fsize_limit_mb": 4, "memory_limit_mb": int(prof["memory_mb"]),
+            "nofile_limit": int(prof.get("nofile", NOFILE_LIMIT)),
         }
-        cmd = _build_docker_run_cmd(container_name, "run", runtime=self.runtime_status.active_runtime)
-        res = _run_bounded_process(
-            cmd=cmd,
-            stdin_bytes=json.dumps(payload).encode("utf-8"),
-            timeout_sec=wall_timeout,
-            max_output_bytes=MAX_OUTPUT_BYTES,
-            container_name=container_name,
-        )
+        if files:
+            b64_files, _ = self._encode_files_b64(files, already_b64=files_are_b64)
+            payload["files"] = b64_files
+        elif norm_lang in ("python", "javascript"):
+            payload["code_b64"] = base64.b64encode(code.encode("utf-8")).decode("ascii")
+        max_out = int(prof.get("max_output_bytes", MAX_OUTPUT_BYTES))
+        res = self._container(env, "run", payload, prof, wall, max_out)
+        mem_label = f"{int(prof['memory_mb'])} MB"
 
         if res["internal_error"]:
-            return SingleTestExecutionResult(
-                status=STATUS_INTERNAL_ERROR,
-                passed=False,
-                actual_output="",
-                execution_time_ms=res["elapsed_ms"],
-                error_message=res["stderr"][:MAX_ERROR_CHARS],
-            )
-
+            return SingleTestExecutionResult(STATUS_INTERNAL_ERROR, False, "", res["elapsed_ms"], res["stderr"][:MAX_ERROR_CHARS])
         if res["output_exceeded"]:
-            return SingleTestExecutionResult(
-                status=STATUS_RUNTIME_ERROR,
-                passed=False,
-                actual_output=res["stdout"][:2000],
-                execution_time_ms=res["elapsed_ms"],
-                error_message=f"Output Limit Exceeded: program produced more than {MAX_OUTPUT_BYTES // 1024} KB of output.",
-            )
-
-        if res["timed_out"] or res["returncode"] == 152:  # 152 = 128 + SIGXCPU(24)
-            return SingleTestExecutionResult(
-                status=STATUS_TLE,
-                passed=False,
-                actual_output=res["stdout"][:2000],
-                execution_time_ms=round(wall_timeout * 1000.0, 2),
-                error_message=f"Time Limit Exceeded (>{wall_timeout:.1f}s).",
-            )
-
+            return SingleTestExecutionResult(STATUS_RUNTIME_ERROR, False, res["stdout"][:2000], res["elapsed_ms"],
+                                             f"Output Limit Exceeded: program produced more than {max_out // 1024} KB of output.")
+        if res["timed_out"] or res["returncode"] == 152:
+            return SingleTestExecutionResult(STATUS_TLE, False, res["stdout"][:2000], round(wall * 1000.0, 2),
+                                             f"Time Limit Exceeded (>{wall:.1f}s).")
         rc = res["returncode"]
         stderr_clean = (res["stderr"] or "").strip()
-
         if rc != 0:
             if "Cannot connect to the Docker daemon" in stderr_clean or "Unable to find image" in stderr_clean or "Unknown runtime" in stderr_clean:
-                return SingleTestExecutionResult(
-                    status=STATUS_INTERNAL_ERROR,
-                    passed=False,
-                    actual_output="",
-                    execution_time_ms=res["elapsed_ms"],
-                    error_message=f"Sandbox unavailable: {stderr_clean[:MAX_ERROR_CHARS]}",
-                )
+                return SingleTestExecutionResult(STATUS_INTERNAL_ERROR, False, "", res["elapsed_ms"], f"Sandbox unavailable: {stderr_clean[:MAX_ERROR_CHARS]}")
             if rc == 137 or "MemoryError" in stderr_clean or "bad_alloc" in stderr_clean or "OutOfMemoryError" in stderr_clean:
-                msg = "Memory Limit Exceeded (256 MB)."
+                msg = f"Memory Limit Exceeded ({mem_label})."
                 if stderr_clean:
                     msg = f"{msg}\n{stderr_clean[:MAX_ERROR_CHARS]}"
-                return SingleTestExecutionResult(
-                    status=STATUS_RUNTIME_ERROR,
-                    passed=False,
-                    actual_output=res["stdout"][:2000],
-                    execution_time_ms=res["elapsed_ms"],
-                    error_message=msg,
-                )
-            if rc == 153:  # SIGXFSZ
-                return SingleTestExecutionResult(
-                    status=STATUS_RUNTIME_ERROR,
-                    passed=False,
-                    actual_output=res["stdout"][:2000],
-                    execution_time_ms=res["elapsed_ms"],
-                    error_message="Output / file size limit exceeded.",
-                )
-            return SingleTestExecutionResult(
-                status=STATUS_RUNTIME_ERROR,
-                passed=False,
-                actual_output=res["stdout"][:2000],
-                execution_time_ms=res["elapsed_ms"],
-                error_message=(stderr_clean or f"Process exited with non-zero code {rc}")[:MAX_ERROR_CHARS],
-            )
+                return SingleTestExecutionResult(STATUS_RUNTIME_ERROR, False, res["stdout"][:2000], res["elapsed_ms"], msg, stderr=stderr_clean)
+            if rc == 153:
+                return SingleTestExecutionResult(STATUS_RUNTIME_ERROR, False, res["stdout"][:2000], res["elapsed_ms"], "Output / file size limit exceeded.")
+            return SingleTestExecutionResult(STATUS_RUNTIME_ERROR, False, res["stdout"][:2000], res["elapsed_ms"],
+                                             (stderr_clean or f"Process exited with non-zero code {rc}")[:MAX_ERROR_CHARS], stderr=stderr_clean)
+        cmp = comparator or compare_outputs
+        matched = bool(cmp(res["stdout"], expected_output))
+        return SingleTestExecutionResult(STATUS_ACCEPTED if matched else STATUS_WRONG_ANSWER, matched, res["stdout"], res["elapsed_ms"], None)
 
-        matched = compare_outputs(res["stdout"], expected_output)
-        return SingleTestExecutionResult(
-            status=STATUS_ACCEPTED if matched else STATUS_WRONG_ANSWER,
-            passed=matched,
-            actual_output=res["stdout"],
-            execution_time_ms=res["elapsed_ms"],
-            error_message=None,
+    # ----------------------------------------------------------- project run (supervisor envelope)
+    def run_project(
+        self,
+        env: Optional[Environment] = None,
+        language: str = "python",
+        *,
+        files: Optional[Dict[str, str]] = None,
+        artifact_b64: str = "",
+        entry_point: Optional[str] = "",
+        stdin_text: str = "",
+        stdin_data: Optional[str] = None,
+        datasets_b64: Optional[str] = "",
+        profile: Optional[Dict[str, float]] = None,
+        harness: Optional[dict] = None,
+        wall_timeout: Optional[float] = None,
+        image: Optional[str] = None,
+        run_timeout: Optional[float] = None,
+        compile_timeout: Optional[float] = None,
+        memory_mb: Optional[int] = None,
+        cpus: Optional[float] = None,
+        pids_limit: Optional[int] = None,
+        nofile_limit: Optional[int] = None,
+        fsize_mb: Optional[int] = None,
+        max_output_bytes: Optional[int] = None,
+        env_vars: Optional[Dict[str, str]] = None,
+        apply_nproc_rlimit: bool = False,
+        files_are_b64: bool = False,
+    ) -> ProjectRunResult:
+        env = self._resolve_env(env, image)
+        norm_lang = normalize_language(language)
+        if not norm_lang or norm_lang not in env.languages:
+            return ProjectRunResult(
+                ok=False,
+                stage="compile",
+                returncode=2,
+                stderr=f"Language '{language}' is not supported by environment '{env.id}'.",
+                error_message=f"Language '{language}' is not supported by environment '{env.id}'.",
+            )
+        prof = dict(profile or effective_profile(env))
+        if run_timeout is not None:
+            prof["wall_timeout_sec"] = float(run_timeout)
+        if compile_timeout is not None:
+            prof["compile_timeout_sec"] = float(compile_timeout)
+        if memory_mb is not None:
+            prof["memory_mb"] = int(memory_mb)
+        if cpus is not None:
+            prof["cpus"] = float(cpus)
+        if pids_limit is not None:
+            prof["pids"] = int(pids_limit)
+        if nofile_limit is not None:
+            prof["nofile"] = int(nofile_limit)
+        if fsize_mb is not None:
+            prof["fsize_mb"] = int(fsize_mb)
+        if max_output_bytes is not None:
+            prof["max_output_bytes"] = int(max_output_bytes)
+
+        b64_files, _ = self._encode_files_b64(files, already_b64=files_are_b64)
+
+        # Compile first when running compiled languages (C, C++, Java) without prebuilt artifact_b64
+        if norm_lang in ("c", "cpp", "java") and not artifact_b64:
+            cmp_res = self.compile_source(
+                norm_lang,
+                "",
+                env=env,
+                files=b64_files,
+                entry_point=entry_point or "",
+                profile=prof,
+                files_are_b64=True,
+            )
+            if not cmp_res.ok:
+                return ProjectRunResult(
+                    ok=False,
+                    stage="compile",
+                    returncode=1,
+                    stderr=cmp_res.error_message or "Compilation failed.",
+                    error_message=cmp_res.error_message or "Compilation failed.",
+                )
+            artifact_b64 = cmp_res.artifact_b64
+
+        wall = float(wall_timeout if wall_timeout is not None else prof["wall_timeout_sec"])
+        out_cap = int(prof["max_output_bytes"])
+
+        effective_stdin = stdin_data if stdin_data is not None else stdin_text
+        if harness and isinstance(harness, dict) and harness.get("calls") is not None:
+            effective_stdin = json.dumps(harness["calls"])
+
+        payload = {
+            "language": norm_lang,
+            "files": b64_files,
+            "artifact_b64": artifact_b64 or "",
+            "entry_point": entry_point or "",
+            "stdin_b64": base64.b64encode((effective_stdin or "").encode("utf-8")).decode("ascii"),
+            "datasets_b64": datasets_b64 or "",
+            "harness": harness,
+            "project_mode": True,
+            "cpu_limit_sec": max(1, int(wall * float(prof["cpus"])) + 2),
+            "fsize_limit_mb": int(prof["fsize_mb"]),
+            "memory_limit_mb": int(prof["memory_mb"]),
+            "nofile_limit": int(prof.get("nofile", 128)),
+            "wall_timeout_sec": wall,
+            "max_output_bytes": out_cap,
+            "threads": int(prof.get("threads", 1)),
+            "limit_address_space": bool(prof.get("limit_address_space", 0)),
+            "max_output_files": int(prof.get("max_output_files", 20)),
+            "max_output_files_bytes": int(prof.get("max_output_files_bytes", 4 * 1024 * 1024)),
+        }
+        env_cap = int((2 * out_cap + int(prof.get("max_output_files_bytes", 0))) * 4 / 3) + 128 * 1024
+        res = self._container(env, "run_project", payload, prof, wall, env_cap)
+        return self._parse_envelope(res, wall)
+
+    def run_evaluator(
+        self,
+        env: Optional[Environment] = None,
+        script: Optional[bytes | str] = None,
+        submission_files: Optional[Dict[str, bytes] | List[dict]] = None,
+        hidden_tar_b64: str = "",
+        config: Optional[dict] = None,
+        profile: Optional[Dict[str, float]] = None,
+        wall_timeout: float = 30.0,
+        *,
+        evaluator_code: Optional[str | bytes] = None,
+        hidden_b64: Optional[str] = None,
+        image: Optional[str] = None,
+        timeout: Optional[float] = None,
+        memory_mb: Optional[int] = None,
+        cpus: Optional[float] = None,
+    ) -> ProjectRunResult:
+        """Run an evaluator script in a SEPARATE container that contains NO student code, only the student's
+        output data and the hidden evaluation data."""
+        env = self._resolve_env(env, image)
+        prof = dict(profile or effective_profile(env))
+        if memory_mb is not None:
+            prof["memory_mb"] = int(memory_mb)
+        if cpus is not None:
+            prof["cpus"] = float(cpus)
+        wt = float(timeout if timeout is not None else wall_timeout)
+
+        raw_script = evaluator_code if evaluator_code is not None else (script or b"")
+        script_bytes = raw_script.encode("utf-8") if isinstance(raw_script, str) else bytes(raw_script)
+
+        sub_map_b64: Dict[str, str] = {}
+        if isinstance(submission_files, list):
+            for item in submission_files:
+                if isinstance(item, dict) and item.get("name"):
+                    if item.get("content_b64") is not None:
+                        sub_map_b64[str(item["name"])] = str(item["content_b64"])
+                    elif item.get("content") is not None:
+                        raw_c = item["content"]
+                        cb = raw_c.encode("utf-8") if isinstance(raw_c, str) else bytes(raw_c)
+                        sub_map_b64[str(item["name"])] = base64.b64encode(cb).decode("ascii")
+        elif isinstance(submission_files, dict):
+            for k, v in submission_files.items():
+                if isinstance(v, bytes):
+                    sub_map_b64[k] = base64.b64encode(v).decode("ascii")
+                else:
+                    sub_map_b64[k] = str(v)
+
+        hid = hidden_b64 if hidden_b64 is not None else (hidden_tar_b64 or "")
+        payload = {
+            "script_b64": base64.b64encode(script_bytes).decode("ascii"),
+            "submission_files": sub_map_b64,
+            "hidden_b64": hid or "",
+            "config": config or {},
+            "wall_timeout_sec": wt,
+            "cpu_limit_sec": max(1, int(wt)) + 2,
+            "fsize_limit_mb": int(prof["fsize_mb"]),
+            "memory_limit_mb": int(prof["memory_mb"]),
+            "nofile_limit": int(prof.get("nofile", 128)),
+            "max_output_bytes": 65536,
+            "threads": int(prof.get("threads", 1)),
+        }
+        res = self._container(env, "evaluate", payload, prof, wt, 4 * 1024 * 1024, kind="evl")
+        return self._parse_envelope(res, wt)
+
+    @staticmethod
+    def _parse_envelope(res: dict, wall: float) -> ProjectRunResult:
+        if res["internal_error"]:
+            return ProjectRunResult(ok=False, internal_error=True, error_message=res["stderr"][:MAX_ERROR_CHARS])
+        if res["timed_out"]:
+            return ProjectRunResult(ok=True, timed_out=True, wall_ms=wall * 1000.0, returncode=-9)
+        if res["output_exceeded"]:
+            return ProjectRunResult(ok=True, output_exceeded=True, wall_ms=res["elapsed_ms"])
+        if res["returncode"] == 137 or not res["stdout"].strip():
+            stderr = (res["stderr"] or "").strip()
+            return ProjectRunResult(ok=True, returncode=res["returncode"], wall_ms=res["elapsed_ms"],
+                                    stderr=stderr[:MAX_ERROR_CHARS], error_message="Process was killed (memory limit or sandbox terminated).")
+        try:
+            env = json.loads(res["stdout"])
+        except Exception as exc:
+            return ProjectRunResult(ok=False, internal_error=True, error_message=f"Invalid envelope from sandbox: {exc}")
+        if env.get("setup_error"):
+            return ProjectRunResult(ok=True, setup_error=str(env["setup_error"])[:1000], stderr=str(env["setup_error"])[:1000], returncode=2)
+        dec = lambda k: base64.b64decode(env.get(k, "") or b"").decode("utf-8", errors="replace")
+        files = {}
+        for n, b in (env.get("files") or {}).items():
+            try:
+                files[n] = base64.b64decode(b)
+            except Exception:
+                pass
+        stdout_str = dec("stdout_b64")
+        stderr_str = dec("stderr_b64")
+        harness_results: List[dict] = []
+        if "@@CODECLAN_RESULTS@@" in stdout_str:
+            stdout_str, _, raw_h = stdout_str.rpartition("@@CODECLAN_RESULTS@@")
+            try:
+                h_obj = json.loads(raw_h.strip())
+                if h_obj.get("load_error"):
+                    harness_results = [{"ok": False, "error": str(h_obj["load_error"])}]
+                else:
+                    for item in h_obj.get("results", []):
+                        harness_results.append(
+                            {
+                                "ok": bool(item.get("ok", False)),
+                                "result": item.get("value"),
+                                "value": item.get("value"),
+                                "error": item.get("error"),
+                            }
+                        )
+            except Exception as exc:
+                harness_results = [{"ok": False, "error": f"Invalid harness JSON: {exc}"}]
+
+        return ProjectRunResult(
+            ok=True, returncode=int(env.get("returncode", -1)), timed_out=bool(env.get("timed_out")),
+            output_exceeded=bool(env.get("output_exceeded")), stdout=stdout_str, stderr=stderr_str,
+            max_rss_kb=int(env.get("max_rss_kb", 0)), cpu_ms=float(env.get("cpu_ms", 0)), wall_ms=float(env.get("wall_ms", res["elapsed_ms"])),
+            files=files, files_truncated=bool(env.get("files_truncated")), result_json=env.get("result_json", ""),
+            harness_results=harness_results,
         )

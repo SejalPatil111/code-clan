@@ -1,4 +1,4 @@
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 from pydantic import BaseModel, EmailStr, Field
 
@@ -82,6 +82,35 @@ class TestCasePublic(BaseModel):
 
 
 # =========================================================
+# DATASET SCHEMAS
+# =========================================================
+
+class DatasetCreate(BaseModel):
+    filename: str = Field(..., min_length=1, max_length=160)
+    visibility: str = Field("public", pattern="^(public|hidden)$")
+    mime_type: str = Field("text/plain", max_length=80)
+    content_b64: Optional[str] = None
+    content_text: Optional[str] = None
+    description: Optional[str] = Field(None, max_length=255)
+
+
+class DatasetPublicResponse(BaseModel):
+    id: int
+    problem_id: int
+    filename: str
+    visibility: str
+    mime_type: str
+    size_bytes: int
+    description: Optional[str] = None
+    preview_text: Optional[str] = None
+    content_b64: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+# =========================================================
 # PROBLEM SCHEMAS
 # =========================================================
 
@@ -94,11 +123,20 @@ class ProblemBase(BaseModel):
     output_format: Optional[str] = None
     constraints: Optional[str] = None
     examples: Optional[str] = None
+    environment_id: str = Field("cp", max_length=40)
+    problem_type: str = Field("competitive", max_length=40)
+    evaluation_type: str = Field("exact", max_length=40)
+    evaluation_config: Optional[Any] = None
+    resource_overrides: Optional[Any] = None
+    starter_files: Optional[Any] = None
+    entry_point: Optional[str] = Field(None, max_length=120)
+    max_score: float = 10.0
 
 
 class ProblemCreate(ProblemBase):
     created_by: Optional[int] = None  # overridden by the authenticated teacher
     test_cases: Optional[List[TestCaseCreate]] = None
+    datasets: Optional[List[DatasetCreate]] = None
 
 
 class ProblemResponse(ProblemBase):
@@ -108,6 +146,9 @@ class ProblemResponse(ProblemBase):
     updated_at: Optional[datetime] = None
     test_cases: Optional[List[TestCasePublic]] = []
     hidden_test_count: int = 0
+    datasets: Optional[List[DatasetPublicResponse]] = []
+    hidden_dataset_count: int = 0
+    environment_info: Optional[Dict[str, Any]] = None
 
     class Config:
         from_attributes = True
@@ -120,7 +161,9 @@ class ProblemResponse(ProblemBase):
 class RunSamplesRequest(BaseModel):
     problem_id: int
     language: str = Field(..., min_length=1, max_length=30)
-    code: str = Field(..., min_length=1, max_length=65536)
+    code: str = Field("", max_length=262144)
+    files: Optional[Dict[str, str]] = None
+    entry_point: Optional[str] = Field(None, max_length=120)
 
 
 class SampleTestCaseResult(BaseModel):
@@ -132,17 +175,24 @@ class SampleTestCaseResult(BaseModel):
     passed: bool
     status: str
     execution_time: Optional[float] = None
+    memory_used: Optional[float] = None
     error_message: Optional[str] = None
+    feedback: Optional[str] = None
+    metrics: Optional[Dict[str, Any]] = None
+    output_files: Optional[List[Dict[str, Any]]] = None
 
 
 class RunSamplesResponse(BaseModel):
     problem_id: int
     language: str
+    environment_id: Optional[str] = "cp"
+    evaluation_type: Optional[str] = "exact"
     status: str
     overall_status: str
     passed_count: int
     total_count: int
     execution_time: Optional[float] = None
+    memory_used: Optional[float] = None
     error_message: Optional[str] = None
     compile_error: Optional[str] = None
     results: List[SampleTestCaseResult] = []
@@ -152,7 +202,9 @@ class SubmissionCreate(BaseModel):
     # Optional for backwards compatibility; derived from authenticated user token on backend.
     user_id: Optional[int] = None
     problem_id: int
-    code: str = Field(..., min_length=1, max_length=65536)
+    code: str = Field("", max_length=262144)
+    files: Optional[Dict[str, str]] = None
+    entry_point: Optional[str] = Field(None, max_length=120)
     language: str = Field(..., min_length=1, max_length=30)
     submission_type: str = Field("practice", pattern="^(practice|assignment|coding_test|competition)$")
     assignment_id: Optional[int] = None
@@ -170,7 +222,10 @@ class PublicSubmissionCaseResult(BaseModel):
     passed: bool
     status: str
     execution_time: Optional[float] = None
+    memory_used: Optional[float] = None
     error_message: Optional[str] = None
+    feedback: Optional[str] = None
+    metrics: Optional[Dict[str, Any]] = None
 
 
 class HiddenTestsSummary(BaseModel):
@@ -185,7 +240,11 @@ class SubmissionResponse(BaseModel):
     user_name: Optional[str] = None
     problem_id: int
     code: str
+    files: Optional[Dict[str, str]] = None
+    entry_point: Optional[str] = None
     language: str
+    environment_id: Optional[str] = "cp"
+    evaluation_type: Optional[str] = "exact"
     status: str
     score: Optional[float] = 0.0
     max_score: float = 10.0
@@ -194,6 +253,7 @@ class SubmissionResponse(BaseModel):
     execution_time: Optional[float] = None
     memory_used: Optional[float] = None
     error_message: Optional[str] = None
+    metrics: Optional[Dict[str, Any]] = None
     submitted_at: Optional[datetime] = None
     evaluated_at: Optional[datetime] = None
     attempt_count: int = 0

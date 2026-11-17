@@ -1,0 +1,45 @@
+# Generic Python execution-environment image for CodeClan (data science, ML, CV, NLP, DL, scientific).
+# Built ahead of time; NOTHING is installed when students run code.
+#   docker build -f backend/sandbox/Dockerfile.pyenv --build-arg ENV_ID=ml -t codeclan-env-ml:1.0 backend/sandbox
+# Requirements live in envs/requirements-<ENV_ID>.txt (pinned versions).
+FROM python:3.11-slim
+
+ARG ENV_ID
+ARG PIP_EXTRA_INDEX=""
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    CODECLAN_ENV_ID=${ENV_ID}
+
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /work /opt && chmod 1777 /work
+
+COPY envs/requirements-${ENV_ID}.txt /tmp/requirements.txt
+RUN if [ -n "$PIP_EXTRA_INDEX" ]; then \
+        pip install --extra-index-url "$PIP_EXTRA_INDEX" -r /tmp/requirements.txt; \
+    else \
+        pip install -r /tmp/requirements.txt; \
+    fi
+
+# NLP extras: spaCy model + NLTK corpora baked in at build time (no downloads at run time).
+RUN if [ "$ENV_ID" = "nlp" ]; then \
+        python -m spacy download en_core_web_sm && \
+        python -m nltk.downloader -d /opt/nltk_data punkt punkt_tab stopwords wordnet averaged_perceptron_tagger; \
+    fi
+
+# Machine-readable manifest of what is REALLY installed (read by the verification tests via `probe`).
+RUN python - <<'PY'
+import importlib.metadata as m, json, os, sys
+pk = {d.metadata["Name"].lower(): d.version for d in m.distributions() if d.metadata["Name"]}
+json.dump({"env_id": os.environ.get("CODECLAN_ENV_ID"), "python": sys.version.split()[0], "packages": pk},
+          open("/opt/codeclan-manifest.json", "w"), indent=1, sort_keys=True)
+PY
+
+COPY sandbox_runner.py /usr/local/bin/sandbox-runner
+RUN sed -i 's/\r$//' /usr/local/bin/sandbox-runner && chmod 0755 /usr/local/bin/sandbox-runner
+
+WORKDIR /work
+USER 65534:65534
