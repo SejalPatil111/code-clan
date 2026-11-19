@@ -49,10 +49,81 @@ export function SectionCard({ title, action, children }) {
 }
 
 export function StatusBadge({ status }) {
-  const isAccepted = status === "Accepted";
-  const isPending = status === "Pending Evaluation" || status === "Running";
+  const isAccepted = status === "Accepted" || status === "Evaluated" || status === "Completed";
+  const isSubmitted = status === "Submitted";
+  const isPending =
+    status === "Pending Evaluation" ||
+    status === "Running" ||
+    status === "In Progress" ||
+    status === "Pending" ||
+    status === "Not Started";
+  if (isSubmitted) {
+    return (
+      <span
+        className="badge"
+        style={{
+          backgroundColor: "#dbeafe",
+          color: "#1e40af",
+          border: "1px solid #93c5fd",
+          fontWeight: 600,
+        }}
+      >
+        {status}
+      </span>
+    );
+  }
   const cls = isAccepted ? "badge-status-accepted" : isPending ? "badge-status-pending" : "badge-hard";
   return <span className={`badge ${cls}`}>{status}</span>;
+}
+
+export function AssignmentStatusBadge({ status }) {
+  const s = status || "Pending";
+  let bg = "#f1f5f9";
+  let fg = "#475569";
+  let border = "#cbd5e1";
+
+  if (s === "Evaluated") {
+    bg = "#dcfce7";
+    fg = "#166534";
+    border = "#86efac";
+  } else if (s === "Submitted") {
+    bg = "#dbeafe";
+    fg = "#1e40af";
+    border = "#93c5fd";
+  } else if (s === "In Progress") {
+    bg = "#fef3c7";
+    fg = "#92400e";
+    border = "#fcd34d";
+  } else if (s === "Late" || s === "Late Submission") {
+    bg = "#fee2e2";
+    fg = "#991b1b";
+    border = "#fca5a5";
+  } else if (s === "Pending" || s === "Not Started") {
+    bg = "#fff7ed";
+    fg = "#9a3412";
+    border = "#fed7aa";
+  }
+
+  return (
+    <span
+      className="badge"
+      style={{
+        backgroundColor: bg,
+        color: fg,
+        border: `1px solid ${border}`,
+        fontWeight: 700,
+        fontSize: 11,
+        padding: "3px 9px",
+        borderRadius: 6,
+        whiteSpace: "nowrap",
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 4,
+      }}
+    >
+      {s}
+    </span>
+  );
 }
 
 export function EmptyState({ children }) {

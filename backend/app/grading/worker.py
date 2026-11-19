@@ -69,6 +69,8 @@ from app.grading.evaluators import (
 )
 from app.grading.sandbox import SandboxExecutor, list_active_sandbox_containers
 from app.models import (
+    AcademicPractical,
+    AcademicPracticalStudent,
     AssignmentProblem,
     AssignmentStudent,
     CodingTestProblem,
@@ -253,6 +255,10 @@ def get_submission_max_score(sub: Submission, db: Session, problem: Optional[Pro
         )
         if ctp and ctp.marks and ctp.marks > 0:
             return float(ctp.marks)
+    elif sub.submission_type == "practical" and getattr(sub, "practical_id", None):
+        prac = db.query(AcademicPractical).filter(AcademicPractical.id == sub.practical_id).first()
+        if prac and prac.max_marks and prac.max_marks > 0:
+            return float(prac.max_marks)
     if problem and getattr(problem, "max_score", None) and float(problem.max_score) > 0:
         return float(problem.max_score)
     return DEFAULT_PROBLEM_MAX_SCORE
@@ -302,6 +308,21 @@ def recompute_coding_test_student_score(coding_test_id: int, student_id: int, db
     )
     if record:
         record.score = total_score
+        if record.status in ("submitted", "completed") and not getattr(record, "xp_awarded", False):
+            pending_cnt = (
+                db.query(Submission)
+                .filter(
+                    Submission.coding_test_id == coding_test_id,
+                    Submission.user_id == student_id,
+                    Submission.submission_type == "coding_test",
+                    ~Submission.status.in_(TERMINAL_STATUSES),
+                )
+                .count()
+            )
+            if pending_cnt == 0:
+                record.xp_awarded = True
+                record.xp_awarded_amount = 10
+                record.xp_awarded_at = datetime.utcnow()
     else:
         record = CodingTestStudent(
             coding_test_id=coding_test_id,
@@ -309,10 +330,51 @@ def recompute_coding_test_student_score(coding_test_id: int, student_id: int, db
             started_at=datetime.utcnow(),
             score=total_score,
             status="in_progress",
+            xp_awarded=False,
+            xp_awarded_amount=0,
         )
         db.add(record)
 
     return total_score
+
+
+def update_practical_student_status(practical_id: int, student_id: int, sub: Submission, db: Session) -> None:
+    """Update AcademicPracticalStudent status and marks based on evaluated practical coding submission."""
+    prac = db.query(AcademicPractical).filter(AcademicPractical.id == practical_id).first()
+    if not prac:
+        return
+    record = (
+        db.query(AcademicPracticalStudent)
+        .filter(
+            AcademicPracticalStudent.practical_id == practical_id,
+            AcademicPracticalStudent.student_id == student_id,
+        )
+        .first()
+    )
+    now = datetime.utcnow()
+    sub_time = sub.submitted_at or now
+    is_late = bool(prac.deadline and sub_time > prac.deadline)
+    target_status = "Late Submission" if is_late else "Evaluated"
+    if not record:
+        record = AcademicPracticalStudent(
+            practical_id=practical_id,
+            student_id=student_id,
+            assigned_at=now,
+            submitted_at=sub_time,
+            evaluated_at=now,
+            status=target_status,
+            submission_id=sub.id,
+            marks_obtained=round(float(sub.score or 0.0), 2),
+        )
+        db.add(record)
+    else:
+        record.submission_id = sub.id
+        if not record.submitted_at:
+            record.submitted_at = sub_time
+        record.evaluated_at = now
+        if record.marks_obtained is None or float(sub.score or 0.0) >= float(record.marks_obtained or 0.0):
+            record.marks_obtained = round(float(sub.score or 0.0), 2)
+        record.status = target_status
 
 
 def update_assignment_student_status(assignment_id: int, student_id: int, db: Session) -> None:
@@ -900,6 +962,8 @@ def evaluate_submission_by_id(
             recompute_coding_test_student_score(sub.coding_test_id, sub.user_id, db)
         elif sub.submission_type == "assignment" and sub.assignment_id:
             update_assignment_student_status(sub.assignment_id, sub.user_id, db)
+        elif sub.submission_type == "practical" and getattr(sub, "practical_id", None):
+            update_practical_student_status(sub.practical_id, sub.user_id, sub, db)
 
         db.commit()
         db.refresh(sub)
@@ -1296,10 +1360,35 @@ def _ensure_worker_schema() -> None:
             alter_stmts.append("ADD COLUMN entry_point VARCHAR(120) NULL")
         if "metrics_json" not in sub_cols:
             alter_stmts.append("ADD COLUMN metrics_json TEXT NULL")
+        if "practical_id" not in sub_cols:
+            alter_stmts.append("ADD COLUMN practical_id INT NULL")
         if alter_stmts:
             with engine.begin() as conn:
                 for stmt in alter_stmts:
                     conn.execute(text(f"ALTER TABLE submissions {stmt}"))
+    if "coding_test_students" in table_names:
+        cts_cols = {c["name"] for c in inspector.get_columns("coding_test_students")}
+        cts_alters = []
+        if "xp_awarded" not in cts_cols:
+            cts_alters.append("ADD COLUMN xp_awarded TINYINT(1) NOT NULL DEFAULT 0")
+        if "xp_awarded_amount" not in cts_cols:
+            cts_alters.append("ADD COLUMN xp_awarded_amount INT NOT NULL DEFAULT 0")
+        if "xp_awarded_at" not in cts_cols:
+            cts_alters.append("ADD COLUMN xp_awarded_at DATETIME NULL")
+        if cts_alters:
+            with engine.begin() as conn:
+                for stmt in cts_alters:
+                    conn.execute(text(f"ALTER TABLE coding_test_students {stmt}"))
+    if "assignments" in table_names:
+        asgn_cols = {c["name"] for c in inspector.get_columns("assignments")}
+        if "allow_copy_paste" not in asgn_cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE assignments ADD COLUMN allow_copy_paste TINYINT(1) NOT NULL DEFAULT 1"))
+    if "coding_tests" in table_names:
+        ct_cols = {c["name"] for c in inspector.get_columns("coding_tests")}
+        if "allow_copy_paste" not in ct_cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE coding_tests ADD COLUMN allow_copy_paste TINYINT(1) NOT NULL DEFAULT 0"))
 
 
 def run_worker_forever() -> None:

@@ -165,8 +165,44 @@ export function fetchSubmissions(filters = {}) {
       user_id: filters.user_id,
       problem_id: filters.problem_id,
       submission_type: filters.submission_type,
+      student_search: filters.student_search,
+      problem_search: filters.problem_search,
+      language: filters.language,
+      status: filters.status,
+      date_from: filters.date_from,
+      date_to: filters.date_to,
+      sort_by: filters.sort_by,
+      limit: filters.limit || 250,
     }),
     { errorMessage: "Failed to fetch submissions" }
+  );
+}
+
+export function fetchGroupedSubmissionsByStudent(filters = {}) {
+  return request(
+    withQuery("/submissions/grouped/by-student", {
+      student_search: filters.student_search,
+      problem_search: filters.problem_search,
+      problem_id: filters.problem_id,
+      submission_type: filters.submission_type,
+      language: filters.language,
+      status: filters.status,
+      date_from: filters.date_from,
+      date_to: filters.date_to,
+      sort_by: filters.sort_by,
+    }),
+    { errorMessage: "Failed to fetch grouped student submissions" }
+  );
+}
+
+export function fetchGroupedSubmissionsByProblem(filters = {}) {
+  return request(
+    withQuery("/submissions/grouped/by-problem", {
+      user_id: filters.user_id,
+      submission_type: filters.submission_type,
+      problem_search: filters.problem_search,
+    }),
+    { errorMessage: "Failed to fetch grouped problem submissions" }
   );
 }
 
@@ -186,7 +222,11 @@ export function createSubmission(submissionData) {
 
 export function fetchAssignments(filters = {}) {
   return request(
-    withQuery("/assignments", { student_id: filters.student_id, created_by: filters.created_by }),
+    withQuery("/assignments", {
+      student_id: filters.student_id,
+      created_by: filters.created_by,
+      search: filters.search,
+    }),
     { errorMessage: "Failed to fetch assignments" }
   );
 }
@@ -199,10 +239,64 @@ export function createAssignment(assignmentData) {
   });
 }
 
-export function fetchCodingTests(filters = {}) {
-  return request(withQuery("/coding-tests", { student_id: filters.student_id }), {
-    errorMessage: "Failed to fetch coding tests",
+export function fetchPracticals(filters = {}) {
+  return request(
+    withQuery("/practicals", {
+      student_id: filters.student_id,
+      subject_name: filters.subject_name,
+      search: filters.search,
+    }),
+    { errorMessage: "Failed to fetch academic practicals" }
+  );
+}
+
+export function createPractical(practicalData) {
+  return request("/practicals", {
+    method: "POST",
+    body: practicalData,
+    errorMessage: "Failed to create academic practical",
   });
+}
+
+export function bulkAssignPracticals(payload) {
+  return request("/practicals/assign", {
+    method: "POST",
+    body: payload,
+    errorMessage: "Failed to assign practicals to students",
+  });
+}
+
+export function startPractical(practicalId) {
+  return request(`/practicals/${practicalId}/start`, {
+    method: "POST",
+    errorMessage: "Failed to start practical",
+  });
+}
+
+export function submitPractical(practicalId, payload) {
+  return request(`/practicals/${practicalId}/submit`, {
+    method: "POST",
+    body: payload,
+    errorMessage: "Failed to submit practical",
+  });
+}
+
+export function evaluateStudentPractical(practicalId, studentId, payload) {
+  return request(`/practicals/${practicalId}/students/${studentId}/evaluate`, {
+    method: "POST",
+    body: payload,
+    errorMessage: "Failed to evaluate student practical",
+  });
+}
+
+export function fetchCodingTests(filters = {}) {
+  return request(
+    withQuery("/coding-tests", {
+      student_id: filters.student_id,
+      search: filters.search,
+    }),
+    { errorMessage: "Failed to fetch coding tests" }
+  );
 }
 
 export function createCodingTest(testData) {

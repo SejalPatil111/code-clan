@@ -428,3 +428,63 @@ table.clan-table tr:hover td {
   border-color: var(--primary);
   box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
 }
+
+/* Resizable Splitters & Workspace Enhancements */
+[data-testid="splitter-left-middle"]:hover > div,
+[data-testid="splitter-middle-right"]:hover > div {
+  background-color: var(--primary) !important;
+  width: 4px !important;
+}
+
+[data-testid="results-panel-resize-handle"]:hover {
+  background-color: #e2e8f0 !important;
+}
+
+@keyframes codeclan-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.spin-icon {
+  animation: codeclan-spin 1s linear infinite;
+}
+
+@media (max-width: 1024px) {
+  .content-area {
+    padding: 16px;
+  }
+  .top-navbar {
+    padding: 0 16px;
+  }
+  .sidebar {
+    width: 210px;
+  }
+}
+
+@media (max-width: 768px) {
+  .app-container {
+    flex-direction: column;
+  }
+  .sidebar {
+    width: 100%;
+    height: auto;
+    position: relative;
+  }
+  .nav-menu {
+    flex-direction: row;
+    flex-wrap: wrap;
+    padding: 8px;
+  }
+  .nav-item {
+    width: auto;
+    padding: 8px 10px;
+    font-size: 12px;
+  }
+  .nav-section-label {
+    display: none;
+  }
+}

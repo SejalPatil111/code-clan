@@ -15,7 +15,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { fetchStudentOverview } from "../api";
-import { StatCard, ToolCard, SectionCard, StatusBadge, EmptyState } from "./ui";
+import { StatCard, ToolCard, SectionCard, StatusBadge, AssignmentStatusBadge, EmptyState } from "./ui";
 import { formatDate } from "./format";
 import "./dashboard.css";
 
@@ -217,24 +217,37 @@ export default function StudentDashboard({ currentUser, onNavigate }) {
           }
         >
           {!o || o.upcoming_deadlines.length === 0 ? (
-            <EmptyState>{isLoading ? "Loading…" : "No upcoming assignments from your teachers."}</EmptyState>
+            <EmptyState>{isLoading ? "Loading…" : "No assignments assigned by your teachers yet."}</EmptyState>
           ) : (
-            o.upcoming_deadlines.map((a) => (
-              <div className="list-row" key={a.id}>
-                <div style={{ minWidth: 0 }}>
-                  <div className="title">{a.title}</div>
-                  <div className="meta">
-                    {a.problems.length} problems · {a.creator_name}
-                  </div>
-                </div>
-                <span
-                  className={`badge ${a.deadline ? "badge-medium" : "badge-easy"}`}
-                  style={{ whiteSpace: "nowrap" }}
-                >
-                  {a.deadline ? `Due ${formatDate(a.deadline)}` : "No deadline"}
-                </span>
-              </div>
-            ))
+            <div className="table-container">
+              <table className="clan-table">
+                <thead>
+                  <tr>
+                    <th>Assignment</th>
+                    <th>Deadline</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {o.upcoming_deadlines.map((a) => (
+                    <tr key={a.id} style={{ cursor: "pointer" }} onClick={() => onNavigate("assignments")}>
+                      <td>
+                        <div style={{ fontWeight: 600, color: "var(--text-main)" }}>{a.title}</div>
+                        <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 2 }}>
+                          {a.progress_text || `${a.submitted_problems_count || 0} of ${a.problems?.length || 0} problems submitted`} · {a.creator_name}
+                        </div>
+                      </td>
+                      <td style={{ whiteSpace: "nowrap", fontSize: 12, color: "var(--text-muted)" }}>
+                        {a.deadline ? formatDate(a.deadline) : "No deadline"}
+                      </td>
+                      <td>
+                        <AssignmentStatusBadge status={a.my_status || "Pending"} />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
         </SectionCard>
       </div>

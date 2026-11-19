@@ -62,6 +62,16 @@ class User(Base):
         back_populates="student"
     )
 
+    practicals_created = relationship(
+        "AcademicPractical",
+        back_populates="creator"
+    )
+
+    practicals = relationship(
+        "AcademicPracticalStudent",
+        back_populates="student"
+    )
+
 
 # =========================================================
 # PROBLEMS
@@ -284,6 +294,13 @@ class Submission(Base):
         nullable=True
     )
 
+    practical_id = Column(
+        Integer,
+        ForeignKey("academic_practicals.id"),
+        nullable=True,
+        index=True
+    )
+
     # Multi-file submission & evaluation metrics
     files_json = Column(Text, nullable=True)
     entry_point = Column(String(120), nullable=True)
@@ -313,6 +330,12 @@ class Submission(Base):
     competition = relationship(
         "Competition",
         back_populates="submissions"
+    )
+
+    practical = relationship(
+        "AcademicPractical",
+        back_populates="submissions",
+        foreign_keys=[practical_id]
     )
 
     results = relationship(
@@ -413,6 +436,12 @@ class Assignment(Base):
     deadline = Column(
         DateTime,
         nullable=True
+    )
+
+    allow_copy_paste = Column(
+        Boolean,
+        nullable=False,
+        default=True
     )
 
     created_at = Column(
@@ -567,6 +596,12 @@ class CodingTest(Base):
         nullable=True
     )
 
+    allow_copy_paste = Column(
+        Boolean,
+        nullable=False,
+        default=False
+    )
+
     created_at = Column(
         DateTime,
         server_default=func.now()
@@ -675,6 +710,23 @@ class CodingTestStudent(Base):
         String(30),
         nullable=False,
         default="not_started"
+    )
+
+    xp_awarded = Column(
+        Boolean,
+        nullable=False,
+        default=False
+    )
+
+    xp_awarded_amount = Column(
+        Integer,
+        nullable=False,
+        default=0
+    )
+
+    xp_awarded_at = Column(
+        DateTime,
+        nullable=True
     )
 
     # Relationships
@@ -872,4 +924,124 @@ class ProblemDataset(Base):
     problem = relationship(
         "Problem",
         back_populates="datasets"
+    )
+
+
+# =========================================================
+# ACADEMIC PRACTICALS (Syllabus-Based Practical Coursework)
+# =========================================================
+
+class AcademicPractical(Base):
+    __tablename__ = "academic_practicals"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    practical_number = Column(Integer, nullable=False, index=True)
+    title = Column(String(200), nullable=False)
+    subject_name = Column(String(150), nullable=False)
+    subject_code = Column(String(50), nullable=True)
+    semester = Column(String(50), nullable=True)
+
+    description = Column(Text, nullable=True)
+    objectives = Column(Text, nullable=True)
+
+    problem_id = Column(
+        Integer,
+        ForeignKey("problems.id"),
+        nullable=True
+    )
+
+    start_date = Column(DateTime, nullable=True)
+    deadline = Column(DateTime, nullable=True)
+    max_marks = Column(Float, nullable=False, default=10.0)
+
+    created_by = Column(
+        Integer,
+        ForeignKey("users.id"),
+        nullable=False
+    )
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    # Relationships
+    creator = relationship(
+        "User",
+        back_populates="practicals_created"
+    )
+
+    problem = relationship(
+        "Problem"
+    )
+
+    students = relationship(
+        "AcademicPracticalStudent",
+        back_populates="practical",
+        cascade="all, delete-orphan"
+    )
+
+    submissions = relationship(
+        "Submission",
+        back_populates="practical",
+        foreign_keys="Submission.practical_id"
+    )
+
+
+class AcademicPracticalStudent(Base):
+    __tablename__ = "academic_practical_students"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    practical_id = Column(
+        Integer,
+        ForeignKey("academic_practicals.id"),
+        nullable=False,
+        index=True
+    )
+
+    student_id = Column(
+        Integer,
+        ForeignKey("users.id"),
+        nullable=False,
+        index=True
+    )
+
+    assigned_at = Column(DateTime, server_default=func.now())
+    submitted_at = Column(DateTime, nullable=True)
+    evaluated_at = Column(DateTime, nullable=True)
+
+    # Allowed statuses: "Not Started", "In Progress", "Submitted", "Evaluated", "Late Submission"
+    status = Column(
+        String(40),
+        nullable=False,
+        default="Not Started"
+    )
+
+    submission_id = Column(
+        Integer,
+        ForeignKey("submissions.id"),
+        nullable=True
+    )
+
+    submission_notes = Column(Text, nullable=True)
+    attachment_filename = Column(String(200), nullable=True)
+    attachment_content_b64 = Column(Text(length=16777215), nullable=True)
+
+    marks_obtained = Column(Float, nullable=True)
+    teacher_feedback = Column(Text, nullable=True)
+
+    # Relationships
+    practical = relationship(
+        "AcademicPractical",
+        back_populates="students"
+    )
+
+    student = relationship(
+        "User",
+        back_populates="practicals"
+    )
+
+    submission = relationship(
+        "Submission",
+        foreign_keys=[submission_id]
     )

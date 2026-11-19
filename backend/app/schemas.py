@@ -206,10 +206,11 @@ class SubmissionCreate(BaseModel):
     files: Optional[Dict[str, str]] = None
     entry_point: Optional[str] = Field(None, max_length=120)
     language: str = Field(..., min_length=1, max_length=30)
-    submission_type: str = Field("practice", pattern="^(practice|assignment|coding_test|competition)$")
+    submission_type: str = Field("practice", pattern="^(practice|assignment|coding_test|competition|practical)$")
     assignment_id: Optional[int] = None
     coding_test_id: Optional[int] = None
     competition_id: Optional[int] = None
+    practical_id: Optional[int] = None
 
 
 class PublicSubmissionCaseResult(BaseModel):
@@ -261,6 +262,8 @@ class SubmissionResponse(BaseModel):
     assignment_id: Optional[int] = None
     coding_test_id: Optional[int] = None
     competition_id: Optional[int] = None
+    practical_id: Optional[int] = None
+    context_label: Optional[str] = None
     problem_title: Optional[str] = None
     public_results: Optional[List[PublicSubmissionCaseResult]] = None
     hidden_summary: Optional[HiddenTestsSummary] = None
@@ -268,6 +271,43 @@ class SubmissionResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class TeacherGroupedStudentSubmission(BaseModel):
+    user_id: int
+    student_name: str
+    student_email: str
+    total_submissions: int = 0
+    problems_attempted: int = 0
+    accepted_count: int = 0
+    pending_or_failed_count: int = 0
+    pending_count: int = 0
+    failed_count: int = 0
+    best_score: float = 0.0
+    latest_submitted_at: Optional[datetime] = None
+    latest_verdict: Optional[str] = None
+
+
+class StudentGroupedProblemSubmission(BaseModel):
+    group_key: str
+    problem_id: int
+    problem_title: str
+    submission_type: str
+    context_label: str
+    assignment_id: Optional[int] = None
+    coding_test_id: Optional[int] = None
+    practical_id: Optional[int] = None
+    competition_id: Optional[int] = None
+    total_attempts: int = 0
+    latest_submission_id: int
+    latest_verdict: str
+    latest_language: str
+    latest_submitted_at: Optional[datetime] = None
+    best_score: float = 0.0
+    max_score: float = 10.0
+    best_passed_count: int = 0
+    total_test_cases: int = 0
+    best_execution_time: Optional[float] = None
 
 
 # =========================================================
@@ -285,6 +325,7 @@ class AssignmentCreate(BaseModel):
     created_by: Optional[int] = None  # overridden by the authenticated teacher
     start_date: Optional[datetime] = None
     deadline: Optional[datetime] = None
+    allow_copy_paste: bool = True
     problem_ids: List[int] = []
     student_ids: List[int] = []
 
@@ -314,9 +355,116 @@ class AssignmentResponse(BaseModel):
     creator_name: Optional[str] = None
     start_date: Optional[datetime] = None
     deadline: Optional[datetime] = None
+    allow_copy_paste: bool = True
     created_at: Optional[datetime] = None
     problems: List[AssignedProblemInfo] = []
     students: List[AssignedStudentInfo] = []
+    # Populated when requested for a specific student (or on Student Dashboard / My Assignments)
+    my_status: Optional[str] = None
+    submitted_problems_count: int = 0
+    evaluated_problems_count: int = 0
+    total_problems_count: int = 0
+    progress_text: Optional[str] = None
+    my_submitted_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+# =========================================================
+# ACADEMIC PRACTICAL SCHEMAS
+# =========================================================
+
+class AcademicPracticalCreate(BaseModel):
+    practical_number: int = Field(..., ge=1, le=200)
+    title: str = Field(..., min_length=2, max_length=200)
+    subject_name: str = Field(..., min_length=2, max_length=150)
+    subject_code: Optional[str] = Field(None, max_length=50)
+    semester: Optional[str] = Field(None, max_length=50)
+    description: Optional[str] = None
+    objectives: Optional[str] = None
+    problem_id: Optional[int] = None
+    start_date: Optional[datetime] = None
+    deadline: Optional[datetime] = None
+    max_marks: float = Field(10.0, gt=0, le=500)
+    student_ids: List[int] = []
+
+
+class AcademicPracticalBulkAssign(BaseModel):
+    practical_ids: List[int] = Field(..., min_length=1)
+    student_ids: List[int] = Field(..., min_length=1)
+    deadline: Optional[datetime] = None
+    objectives: Optional[str] = None
+
+
+class AcademicPracticalStudentSubmit(BaseModel):
+    submission_notes: Optional[str] = None
+    attachment_filename: Optional[str] = Field(None, max_length=200)
+    attachment_content_b64: Optional[str] = None
+    submission_id: Optional[int] = None
+
+
+class AcademicPracticalEvaluateRequest(BaseModel):
+    status: str = Field("Evaluated", pattern="^(Not Started|In Progress|Submitted|Evaluated|Late Submission)$")
+    marks_obtained: Optional[float] = Field(None, ge=0)
+    teacher_feedback: Optional[str] = None
+
+
+class AcademicPracticalStudentInfo(BaseModel):
+    id: int
+    practical_id: int
+    student_id: int
+    student_name: str
+    student_email: str
+    assigned_at: Optional[datetime] = None
+    submitted_at: Optional[datetime] = None
+    evaluated_at: Optional[datetime] = None
+    status: str
+    submission_id: Optional[int] = None
+    submission_notes: Optional[str] = None
+    attachment_filename: Optional[str] = None
+    attachment_content_b64: Optional[str] = None
+    marks_obtained: Optional[float] = None
+    teacher_feedback: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class AcademicPracticalResponse(BaseModel):
+    id: int
+    practical_number: int
+    title: str
+    subject_name: str
+    subject_code: Optional[str] = None
+    semester: Optional[str] = None
+    description: Optional[str] = None
+    objectives: Optional[str] = None
+    problem_id: Optional[int] = None
+    problem_title: Optional[str] = None
+    problem_difficulty: Optional[str] = None
+    problem_topic: Optional[str] = None
+    start_date: Optional[datetime] = None
+    deadline: Optional[datetime] = None
+    max_marks: float = 10.0
+    created_by: int
+    creator_name: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    assigned_count: int = 0
+    submitted_count: int = 0
+    evaluated_count: int = 0
+    pending_count: int = 0
+    late_count: int = 0
+    students: List[AcademicPracticalStudentInfo] = []
+    # Populated when requested for a specific student
+    my_status: Optional[str] = None
+    my_submitted_at: Optional[datetime] = None
+    my_marks_obtained: Optional[float] = None
+    my_teacher_feedback: Optional[str] = None
+    my_submission_id: Optional[int] = None
+    my_submission_notes: Optional[str] = None
+    my_attachment_filename: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -346,6 +494,7 @@ class CodingTestCreate(BaseModel):
     duration: int = Field(60, ge=5, le=360)  # duration in minutes
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
+    allow_copy_paste: bool = False
     problem_ids: List[int] = []  # existing question bank problem IDs
     custom_problems: Optional[List[NewCustomProblemInput]] = []  # uniquely created test questions
 
@@ -359,12 +508,17 @@ class CodingTestResponse(BaseModel):
     duration: Optional[int] = 60
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
+    allow_copy_paste: bool = False
     created_at: Optional[datetime] = None
     problems: List[AssignedProblemInfo] = []
     enrolled_count: int = 0
     completed_count: int = 0
     my_status: Optional[str] = None  # populated when requested for a specific student
     my_score: Optional[float] = None
+    xp_reward: int = 10
+    xp_awarded: bool = False
+    xp_awarded_amount: int = 0
+    xp_awarded_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
